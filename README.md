@@ -53,6 +53,8 @@ docktdeep --gpu --proteins protein.pdb --ligands ligand.mol2 --output-csv result
 
 Predict binding affinities for protein-ligand pairs _(predictions are given in kcal/mol)_.
 
+
+
 ```bash
 # single protein-ligand pair
 docktdeep predict --proteins protein.pdb --ligands ligand.pdb --output-csv results.csv
@@ -73,30 +75,15 @@ docktdeep predict \
 # multi-mol2 file (e.g., docking output with multiple poses)
 docktdeep predict \
     --proteins protein.pdb \
-    --ligands docked_poses.mol2 \
-    --output-csv results.csv
+    --ligands docked_poses.mol2
 
 # options available in help
 docktdeep predict --help
 ```
 
-> [!TIP]
-> When using a single protein with multiple ligands, the protein is automatically replicated — no need to repeat the protein path.
-> Multi-mol2 files (common output from docking programs like AutoDock Vina or GOLD) are automatically split into individual molecules.
-
-> [!TIP]
-> Use shell globbing patterns to process multiple files efficiently.
-> ```bash
-> # using regex expansion
-> docktdeep predict \
->    --proteins $(ls path/to/proteins/*_protein.pdb) \
->    --ligands $(ls path/to/ligands/*_ligand.pdb)
->
-> # another example using find command for more complex patterns
-> docktdeep predict \
->    --proteins $(find /data/complexes -name "*_protein_prep.pdb" | sort) \
->    --ligands $(find /data/complexes -name "*_ligand_rnum.pdb" | sort)
-> ```
+> [!NOTE]
+> * When using a single protein with multiple ligands, the protein is automatically replicated (no need to repeat the protein path).
+> * Multi-mol2 files (common output from docking programs) are automatically split into individual molecules.
 
 
 ## ⚙️ Development setup
