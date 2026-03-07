@@ -64,9 +64,25 @@ docktdeep predict \
     --output-csv results.csv \
     --max-batch-size 16
 
+# single protein with multiple ligands (protein auto-replicated)
+docktdeep predict \
+    --proteins protein.pdb \
+    --ligands ligand1.mol2 ligand2.mol2 ligand3.mol2 \
+    --output-csv results.csv
+
+# multi-mol2 file (e.g., docking output with multiple poses)
+docktdeep predict \
+    --proteins protein.pdb \
+    --ligands docked_poses.mol2 \
+    --output-csv results.csv
+
 # options available in help
 docktdeep predict --help
 ```
+
+> [!TIP]
+> When using a single protein with multiple ligands, the protein is automatically replicated — no need to repeat the protein path.
+> Multi-mol2 files (common output from docking programs like AutoDock Vina or GOLD) are automatically split into individual molecules.
 
 > [!TIP]
 > Use shell globbing patterns to process multiple files efficiently.
