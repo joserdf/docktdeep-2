@@ -1,4 +1,3 @@
-
 .git
 .vscode
 .idea
@@ -8,3 +7,8 @@ __pycache__
 venv
 .venv
 env
+*.mol2
+.mypy_cache
+*.egg-info
+dist
+build

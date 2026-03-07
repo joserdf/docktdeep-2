@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE="docktdeep:latest"
+
+gpu_args=""
+passthrough_args=()
+
+for arg in "$@"; do
+    if [[ "$arg" == "--gpu" ]]; then
+        gpu_args="--gpus all"
+    else
+        passthrough_args+=("$arg")
+    fi
+done
+
+exec docker run --rm --user "$(id -u):$(id -g)" -v "$(pwd):/data" $gpu_args "$IMAGE" "${passthrough_args[@]}"

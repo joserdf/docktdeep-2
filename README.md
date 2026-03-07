@@ -20,6 +20,31 @@ Quick setup for inference. Install the package directly from PyPI:
 pip install docktdeep
 ```
 
+### Using Docker
+
+For a containerized setup that requires no Python environment:
+
+```bash
+# clone the repository (needed for the model checkpoint)
+git clone https://github.com/gmmsb-lncc/docktdeep.git
+cd docktdeep
+
+# build the image and install the wrapper script
+./install.sh
+```
+
+This installs a `docktdeep` command system-wide. Run it from any directory containing your data files:
+
+```bash
+docktdeep --proteins protein.pdb --ligands ligand.mol2 --output-csv results.csv
+
+# with GPU support
+docktdeep --gpu --proteins protein.pdb --ligands ligand.mol2 --output-csv results.csv
+```
+
+> [!NOTE]
+> The wrapper automatically mounts the current working directory into the container.
+> All input files must be in the current directory and output files will be written there.
 
 
 ## 🚀 Quick start
