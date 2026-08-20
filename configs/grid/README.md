@@ -59,14 +59,18 @@ python train.py \
 
 | # | Flags necessárias | Implementado? |
 |---|-------------------|---------------|
-| 1 | —                | ✅ executável hoje |
-| 2 | `--use-esm2`     | 🔜 M2 + M3 |
-| 3 | `--use-chemberta`| 🔜 M2 + M3 |
-| 4 | `--use-esm2 --use-chemberta` | 🔜 M2 + M3 |
-| 5 | `--semi`         | 🔜 M4 |
-| 6 | `--use-esm2 --semi` | 🔜 M2+M3+M4 |
-| 7 | `--use-chemberta --semi` | 🔜 M2+M3+M4 |
-| 8 | `--use-esm2 --use-chemberta --semi` | 🔜 M2+M3+M4 |
+| 1 | —                | ✅ executável |
+| 2 | `--use-esm2`     | ✅ (M2/M3) |
+| 3 | `--use-chemberta`| ✅ (M2/M3) |
+| 4 | `--use-esm2 --use-chemberta` | ✅ (M2/M3) |
+| 5 | `--semi`         | ✅ (M4) |
+| 6 | `--use-esm2 --semi` | ✅ (M2/M3/M4) |
+| 7 | `--use-chemberta --semi` | ✅ (M2/M3/M4) |
+| 8 | `--use-esm2 --use-chemberta --semi` | ✅ (M2/M3/M4) |
+
+> Todos os arranjos executáveis desde M4 (março de M2-M4). Embeddings pré-computados em
+> `data/embeddings/` (ESM-2 650M/150M/35M/8M + ChemBERTa). Flags de fator C: `--semi`,
+> `--loss huber`, `--label-smoothing`, `--lambda-semi`. Ver `tools/*.py`.
 
 > Hipóteses: mesmo corpus, splits e seeds em todos os arranjos (spec 05); ≥3 seeds por
 > config; média ± IC no relatório (PLAN.md §7, §8, §9).
