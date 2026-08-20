@@ -4,6 +4,10 @@ from torchmetrics.regression import MeanAbsoluteError
 
 __all__ = ["Baseline"]
 
+# ESM-2 model key -> embedding dim (matches tools/precompute_esm2.py).
+ESM2_DIMS = {"esm2-650M": 1280, "esm2-150M": 640, "esm2-35M": 480, "esm2-8M": 320}
+E_LIG_DIM = 768  # ChemBERTa (zinc-base)
+
 
 class ConvGroup(torch.nn.Sequential):
     def __init__(self, in_c, out_c, kernel_size, **kwargs):
@@ -82,6 +86,11 @@ class Baseline(pl.LightningModule):
         self.test_set_outputs = []
         self.validation_logs = []
 
+        use_esm2 = bool(self.hparams.get("use_esm2", False))
+        use_chemberta = bool(self.hparams.get("use_chemberta", False))
+        f_dim = int(self.hparams.get("f_dim", 512))
+        emb_proj_dim = int(self.hparams.get("emb_proj_dim", 128))
+
         conv = ConvGroup if not self.hparams.depthwise_convs else ConvGroupDepthwise
         conv1 = conv(input_size[0], 64, 5)
         conv2 = conv(64, 128, 5)
@@ -96,20 +105,56 @@ class Baseline(pl.LightningModule):
             else flatten
         )
 
-        self.fc1 = FCGroup(
-            256 * (2**3 if self.hparams.adaptive_pooling else 3**3),
-            self.hparams.num_fc_units[0],
-            self.hparams.dropout,
+        # compact deterministic latent `f`
+        flat_dim = 256 * (2**3 if self.hparams.adaptive_pooling else 3**3)
+        self.f_proj = torch.nn.Sequential(
+            torch.nn.Linear(flat_dim, f_dim, bias=False),
+            torch.nn.BatchNorm1d(f_dim),
+            torch.nn.ReLU(inplace=True),
         )
-        self.linear = torch.nn.Linear(self.hparams.num_fc_units[-1], 1)
 
-    def forward(self, x):
+        # embedding conditioning projections (factors A / B)
+        self.emb_proj_dim = emb_proj_dim
+        self.proj_prot = None
+        self.proj_lig = None
+        if use_esm2:
+            e_prot_dim = ESM2_DIMS.get(self.hparams.get("esm2_model", "esm2-650M"), 1280)
+            self.proj_prot = torch.nn.Sequential(
+                torch.nn.Linear(e_prot_dim, emb_proj_dim, bias=False),
+                torch.nn.BatchNorm1d(emb_proj_dim),
+                torch.nn.ReLU(inplace=True),
+            )
+        if use_chemberta:
+            self.proj_lig = torch.nn.Sequential(
+                torch.nn.Linear(E_LIG_DIM, emb_proj_dim, bias=False),
+                torch.nn.BatchNorm1d(emb_proj_dim),
+                torch.nn.ReLU(inplace=True),
+            )
+
+        # prediction head over f (+ conditioned embeddings)
+        head_in = f_dim + (emb_proj_dim if use_esm2 else 0) + (emb_proj_dim if use_chemberta else 0)
+        fc_units = list(self.hparams.num_fc_units)
+        self.head = torch.nn.Sequential()
+        prev = head_in
+        for u in fc_units:
+            self.head.append(torch.nn.Linear(prev, u, bias=False))
+            self.head.append(torch.nn.BatchNorm1d(u))
+            self.head.append(torch.nn.ReLU(inplace=True))
+            self.head.append(torch.nn.Dropout(self.hparams.dropout))
+            prev = u
+        self.head.append(torch.nn.Linear(prev, 1))
+
+    def forward(self, x, e_prot=None, e_lig=None):
         x = self.conv_layers(x)
         x = self.flatten(x)
-        x = self.fc1(x)
-        # x = self.fc_layers(x)
-        x = self.linear(x)
-        return x
+        f = self.f_proj(x)  # compact latent, exposed as attribute for the contrastive head
+        self.last_f = f
+
+        if self.proj_prot is not None and e_prot is not None:
+            f = torch.cat([f, self.proj_prot(e_prot)], dim=1)
+        if self.proj_lig is not None and e_lig is not None:
+            f = torch.cat([f, self.proj_lig(e_lig)], dim=1)
+        return self.head(f)
 
     @staticmethod
     def add_specific_args(parent_parser):
@@ -130,6 +175,8 @@ class Baseline(pl.LightningModule):
         # parser.add_argument("--kernel-sizes", type=int, nargs="+", default=[3], help="Kernel size in each conv layer.")
         parser.add_argument("--depthwise-convs", action="store_true", help="Use depthwise separable convolutions.")
         parser.add_argument("--adaptive-pooling", action="store_true", help="Use adaptive pooling before flattening.")
+        parser.add_argument("--f-dim", type=int, default=512, help="Dimension of the compact latent f.")
+        parser.add_argument("--emb-proj-dim", type=int, default=128, help="Dimension of embedding conditioning projections.")
         # fmt: on
         return parent_parser
 
@@ -143,8 +190,12 @@ class Baseline(pl.LightningModule):
         )
 
     def shared_step(self, batch, batch_idx, stage):
-        x, y = batch
-        y_pred = self(x)
+        if len(batch) == 4:
+            x, e_prot, e_lig, y = batch
+        else:
+            x, y = batch
+            e_prot = e_lig = None
+        y_pred = self(x, e_prot, e_lig)
 
         log_params = {
             "on_step": False,

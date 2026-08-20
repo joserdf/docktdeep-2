@@ -178,5 +178,11 @@ def parse_args():
     return args
 
 if __name__ == "__main__":
+    # DataLoader workers + CUDA require 'spawn' on Linux (fork re-inits CUDA).
+    import multiprocessing
+    try:
+        multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
     args = parse_args()
     run(args)

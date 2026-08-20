@@ -164,6 +164,22 @@ class PDBbind(pl.LightningDataModule):
 
         e_prot, e_lig = self._load_embeddings(sample_ids)
 
+        # drop samples missing a required embedding when a factor is active
+        keep = [True] * len(sample_ids)
+        if self.use_esm2:
+            keep = [k and (e is not None) for k, e in zip(keep, e_prot)]
+        if self.use_chemberta:
+            keep = [k and (e is not None) for k, e in zip(keep, e_lig)]
+        if not all(keep):
+            idx = [i for i, k in enumerate(keep) if k]
+            protein_mols = [protein_mols[i] for i in idx]
+            ligand_mols = [ligand_mols[i] for i in idx]
+            labels = [labels[i] for i in idx]
+            sample_ids = [sample_ids[i] for i in idx]
+            e_prot = [e_prot[i] for i in idx] if e_prot is not None else None
+            e_lig = [e_lig[i] for i in idx] if e_lig is not None else None
+            print(f"  ({split}) removidos por embedding ausente: {len(keep) - len(idx)}")
+
         # apply molecular dropout view
         voxel_grid = self.voxel_grid
         if self.molecular_dropout > 0.0 and split == "train":
@@ -219,19 +235,47 @@ class PDBbind(pl.LightningDataModule):
             ]
         return e_prot, e_lig
 
+    @staticmethod
+    def _collate(batch):
+        """Collate samples that may carry embeddings (4-tuple) or not (2-tuple).
+
+        Embedding positions that are all None collapse back to None; mixed
+        None/array positions are zero-padded (should not happen after filtering).
+        """
+        if len(batch[0]) == 4:
+            voxs = torch.stack([b[0] for b in batch])
+            y = torch.stack([b[3] for b in batch])
+
+            def maybe_stack(lst):
+                if any(v is not None for v in lst):
+                    ref = lst[0]
+                    return torch.stack(
+                        [torch.as_tensor(v) if v is not None else torch.zeros_like(torch.as_tensor(ref))
+                         for v in lst]
+                    )
+                return None
+
+            return voxs, maybe_stack([b[1] for b in batch]), maybe_stack([b[2] for b in batch]), y
+        voxs = torch.stack([b[0] for b in batch])
+        y = torch.stack([b[1] for b in batch])
+        return voxs, y
+
     def train_dataloader(self):
         return torch.utils.data.DataLoader(
-            self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers
+            self.train_dataset, batch_size=self.batch_size, shuffle=True,
+            num_workers=self.num_workers, collate_fn=PDBbind._collate,
         )
 
     def val_dataloader(self):
         return torch.utils.data.DataLoader(
-            self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers
+            self.val_dataset, batch_size=self.batch_size, shuffle=False,
+            num_workers=self.num_workers, collate_fn=PDBbind._collate,
         )
 
     def test_dataloader(self):
         return torch.utils.data.DataLoader(
-            self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers
+            self.test_dataset, batch_size=self.batch_size, shuffle=False,
+            num_workers=self.num_workers, collate_fn=PDBbind._collate,
         )
 
 
