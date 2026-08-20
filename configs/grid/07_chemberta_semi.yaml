@@ -1,0 +1,43 @@
+# Arranjo 07 — A: ESM-2 OFF, B: ChemBERTa ON, C: Reg/Semi ON
+# A implementar em M2 + M3 + M4.
+arrangement: "07"
+name: chemberta_semi
+factors:
+  esm2: off
+  chemberta: on
+  semi: on
+command_flags:
+  use_esm2: false
+  use_chemberta: true
+  semi: true
+
+model: Baseline
+
+data:
+  dataframe_path: data/pdbbind2020/index-pfam.csv
+  root_dir: data/pdbbind2020/processed
+  split_column: random_split
+  merge_val_test: true
+  protein_path_pattern: "{c}_protein_prep.pdb.pkl"
+  ligand_path_pattern: "{c}_ligand_rnum.pdb.pkl"
+  batch_size: 64
+  num_workers: 8
+  vox_size: 1.0
+  box_dims: [24.0, 24.0, 24.0]
+  view: ["VolumeView", "BasicView"]
+  occupancy: gaussian
+  random_rotation: true
+
+train:
+  max_epochs: 1500
+  optimizer: AdamW
+  lr: 0.00087469
+  beta1: 0.25693012
+  eps: 0.00032933
+  dropout: 0.25348994
+  wdecay: 0.0000169
+  molecular_dropout: 0.06
+  molecular_dropout_unit: complex
+  depthwise_convs: true
+  adaptive_pooling: true
+  lambda_semi: 0.1
