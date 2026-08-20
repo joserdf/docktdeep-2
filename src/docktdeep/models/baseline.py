@@ -1,5 +1,6 @@
 import lightning.pytorch as pl
 import torch
+import torch.nn.functional as F
 from torchmetrics.regression import MeanAbsoluteError
 
 __all__ = ["Baseline"]
@@ -88,8 +89,10 @@ class Baseline(pl.LightningModule):
 
         use_esm2 = bool(self.hparams.get("use_esm2", False))
         use_chemberta = bool(self.hparams.get("use_chemberta", False))
+        semi = bool(self.hparams.get("semi", False))
         f_dim = int(self.hparams.get("f_dim", 512))
         emb_proj_dim = int(self.hparams.get("emb_proj_dim", 128))
+        proj_dim = int(self.hparams.get("proj_dim", 128))
 
         conv = ConvGroup if not self.hparams.depthwise_convs else ConvGroupDepthwise
         conv1 = conv(input_size[0], 64, 5)
@@ -144,6 +147,33 @@ class Baseline(pl.LightningModule):
             prev = u
         self.head.append(torch.nn.Linear(prev, 1))
 
+        # projection head p(f) for the semi-supervised objective (factor C)
+        self.proj_head = None
+        self.proj_target = None
+        if semi:
+            self.proj_head = torch.nn.Sequential(
+                torch.nn.Linear(f_dim, proj_dim, bias=False),
+                torch.nn.ReLU(inplace=True),
+                torch.nn.Dropout(0.1),  # stochasticity for R-Drop consistency
+                torch.nn.Linear(proj_dim, proj_dim, bias=False),
+            )
+            target_in = 0
+            if use_esm2:
+                target_in += ESM2_DIMS.get(self.hparams.get("esm2_model", "esm2-650M"), 1280)
+            if use_chemberta:
+                target_in += E_LIG_DIM
+            if target_in > 0:
+                self.proj_target = torch.nn.Linear(target_in, proj_dim, bias=False)
+
+        # affinity loss (Huber robust to experimental noise) + label smoothing
+        if self.hparams.get("loss", "mse") == "huber":
+            self.loss_fn = torch.nn.SmoothL1Loss(beta=self.hparams.get("huber_beta", 1.0))
+        else:
+            self.loss_fn = torch.nn.MSELoss()
+        self.label_smoothing = float(self.hparams.get("label_smoothing", 0.0))
+        self.lambda_semi = float(self.hparams.get("lambda_semi", 1.0))
+        self.tau = float(self.hparams.get("semi_tau", 0.1))
+
     def forward(self, x, e_prot=None, e_lig=None):
         x = self.conv_layers(x)
         x = self.flatten(x)
@@ -177,6 +207,13 @@ class Baseline(pl.LightningModule):
         parser.add_argument("--adaptive-pooling", action="store_true", help="Use adaptive pooling before flattening.")
         parser.add_argument("--f-dim", type=int, default=512, help="Dimension of the compact latent f.")
         parser.add_argument("--emb-proj-dim", type=int, default=128, help="Dimension of embedding conditioning projections.")
+        parser.add_argument("--semi", action="store_true", default=False, help="Enable factor C: semi-supervised + regularizers.")
+        parser.add_argument("--loss", type=str, default="mse", choices=["mse", "huber"], help="Affinity regression loss.")
+        parser.add_argument("--huber-beta", type=float, default=1.0, help="Huber loss beta (if --loss huber).")
+        parser.add_argument("--label-smoothing", type=float, default=0.0, help="Shrink regression targets toward batch mean.")
+        parser.add_argument("--lambda-semi", type=float, default=1.0, help="Weight of L_semi in the total loss.")
+        parser.add_argument("--proj-dim", type=int, default=128, help="Projection head p(f) output dim (factor C).")
+        parser.add_argument("--semi-tau", type=float, default=0.1, help="Temperature for contrastive L_semi.")
         # fmt: on
         return parent_parser
 
@@ -188,6 +225,31 @@ class Baseline(pl.LightningModule):
             eps=self.hparams.eps,
             weight_decay=self.hparams.wdecay,
         )
+
+    def _semi_loss(self, x, e_prot, e_lig):
+        """L_semi (factor C): consistency (R-Drop) + optional contrastive InfoNCE."""
+        self.train()  # enable dropout for stochastic passes
+        p1 = F.normalize(self.proj_head(self.forward_base_f(x, e_prot, e_lig)), dim=1)
+        p2 = F.normalize(self.proj_head(self.forward_base_f(x, e_prot, e_lig)), dim=1)
+        loss = F.mse_loss(p1, p2)  # consistency: align p(f) under two stochastic passes
+
+        parts = []
+        if self.proj_prot is not None and e_prot is not None:
+            parts.append(e_prot)
+        if self.proj_lig is not None and e_lig is not None:
+            parts.append(e_lig)
+        if self.proj_target is not None and parts:
+            t = F.normalize(self.proj_target(torch.cat(parts, dim=1)), dim=1)
+            sim = p1 @ t.T / self.tau
+            labels = torch.arange(len(p1), device=p1.device)
+            loss = loss + F.cross_entropy(sim, labels)  # InfoNCE anchoring p(f) to (e_prot,e_lig)
+        return loss
+
+    def forward_base_f(self, x, e_prot=None, e_lig=None):
+        """Forward up to the base latent f (before embedding conditioning)."""
+        f = self.f_proj(self.flatten(self.conv_layers(x)))
+        self.last_f = f
+        return f
 
     def shared_step(self, batch, batch_idx, stage):
         if len(batch) == 4:
@@ -204,7 +266,14 @@ class Baseline(pl.LightningModule):
             "logger": True,
         }
 
-        loss = self.loss_fn(y_pred, y.reshape(y.shape[0], 1))
+        y_target = y.reshape(y.shape[0], 1)
+        if self.label_smoothing > 0.0 and stage == "train":
+            y_target = y_target * (1.0 - self.label_smoothing) + y_target.mean() * self.label_smoothing
+        loss = self.loss_fn(y_pred, y_target)
+        if self.proj_head is not None and stage == "train":
+            semi = self._semi_loss(x, e_prot, e_lig)
+            loss = loss + self.lambda_semi * semi
+            self.log("train_semi", semi.detach(), **log_params)
         self.log(f"{stage}_loss", loss, **log_params)
 
         if stage == "train":
