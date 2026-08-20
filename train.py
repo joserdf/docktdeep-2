@@ -79,6 +79,23 @@ def configure_logger(args):
         experiment=args.experiment,
         log_system_params=False,
     )
+
+    # AimLogger.finalize() only calls run.close(); it never calls
+    # report_successful_finish(), so the run is never marked "finished" and its
+    # metrics are not queryable via the SDK. Patch the instance finalize to
+    # report a successful finish (blocking until flushed) before closing.
+    _orig_finalize = logger.finalize
+
+    def _finalize(self, status: str = "") -> None:
+        run = getattr(self, "_run", None)
+        if run is not None and status == "success":
+            try:
+                run.report_successful_finish(block=True)
+            except Exception:
+                pass
+        _orig_finalize(status)
+
+    logger.finalize = _finalize.__get__(logger, AimLogger)
     return logger
 
 
