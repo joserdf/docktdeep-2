@@ -13,12 +13,23 @@ from aim.pytorch_lightning import AimLogger
 from docktgrid.view import BasicView, VolumeView
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 
+from src.docktgrid_2.NewViewComplex import NewViewComplex
+from src.docktgrid_2.NewViewLigProt import NewViewLigProt
+from src.docktgrid_2.BasicViewComplex import BasicViewComplex
+from src.docktgrid_2.BasicViewLigProt import BasicViewLigProt
+from src.docktgrid_2.VolumeViewComplex import VolumeViewComplex
+from src.docktgrid_2.VolumeViewLigProt import VolumeViewLigProt
+from src.docktgrid_2.CustomVoxelGrid import CustomVoxelGrid
+
 from src.docktdeep.dataset import PDBbind
 from src.docktdeep.models import *
 from src.docktdeep.transforms import MolecularDropout, Random90DegreesRotation
 
 
 def run(args):
+    torch.set_float32_matmul_precision("medium")
+    dotenv.load_dotenv()
+
     pl.seed_everything(args.seed)
 
     callbacks = configure_callbacks()
@@ -54,10 +65,11 @@ def run(args):
 def configure_voxel_grid(args):
     views = [eval(v)() for v in args.view]
 
-    return docktgrid.VoxelGrid(
+    return CustomVoxelGrid(
         vox_size=args.vox_size,
         box_dims=args.box_dims,
         views=views,
+        occupancy=args.occupancy,
     )
 
 
@@ -86,7 +98,6 @@ def get_git_revision_hash() -> str:
     except Exception:
         return "unknown"
 
-
 def track_files(logger) -> None:
     files = [os.path.abspath(__file__), os.path.abspath("src/docktdeep/dataset.py")]
     files.extend([os.path.abspath(f) for f in glob.glob("src/docktdeep/models/*.py")])
@@ -98,11 +109,7 @@ def track_files(logger) -> None:
             file = aim.Text(f.read())
         logger.experiment.track(file, name=os.path.basename(files[idx]))
 
-
-if __name__ == "__main__":
-    torch.set_float32_matmul_precision("medium")
-    dotenv.load_dotenv()
-
+def get_parser():
     parser = argparse.ArgumentParser(
         add_help=False, formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
@@ -144,7 +151,15 @@ if __name__ == "__main__":
     eval(tmp_args.model).add_specific_args(parser)
 
     parser.add_argument("--help", "-h", action="help", default=argparse.SUPPRESS)
+
+    return parser
+
+def parse_args():
+    parser = get_parser()
     args = parser.parse_args()
     args.hostname = os.uname().nodename
+    return args
 
+if __name__ == "__main__":
+    args = parse_args()
     run(args)

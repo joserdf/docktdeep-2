@@ -76,7 +76,7 @@ class Baseline(pl.LightningModule):
     def __init__(self, input_size: tuple[int], **kwargs):
         super().__init__()
         self.save_hyperparameters()
-        self.loss_fn = torch.nn.MSELoss()
+        self.loss_fn = torch.nn.MSELoss() # Try: L1Loss, SmoothL1Loss, HuberLoss
         self.mae = MeanAbsoluteError()
         self.validation_step_outputs = []
         self.test_set_outputs = []
