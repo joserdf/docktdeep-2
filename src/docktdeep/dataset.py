@@ -1,4 +1,6 @@
 import copy
+import hashlib
+import json
 import os
 import pickle
 from typing import Optional
@@ -30,6 +32,10 @@ class PDBbind(pl.LightningDataModule):
         split_column: str = "random_split",  # Column name in the dataframe used to select train/validation/test splits
         merge_val_test: bool = False,
         num_workers: int = 4,
+        use_esm2: bool = False,
+        use_chemberta: bool = False,
+        embeddings_dir: str = "data/embeddings",
+        esm2_model: str = "esm2-650M",
         **kwargs,
     ):
         super().__init__()
@@ -46,6 +52,10 @@ class PDBbind(pl.LightningDataModule):
         self.split_column = split_column
         self.merge_val_test = merge_val_test
         self.num_workers = num_workers
+        self.use_esm2 = use_esm2
+        self.use_chemberta = use_chemberta
+        self.embeddings_dir = embeddings_dir
+        self.esm2_model = esm2_model
 
     @staticmethod
     def add_specific_args(parent_parser):
@@ -65,6 +75,10 @@ class PDBbind(pl.LightningDataModule):
         parser.add_argument("--ligand-path-pattern", type=str, default="{c}_ligand_rnum.pdb.pkl", help="Path pattern for ligand files, use {c} as placeholder for PDB ID")
         parser.add_argument("--split-column", type=str, default="random_split", help="Column name in the dataframe used to select train/validation/test splits")
         parser.add_argument("--merge-val-test", action="store_true", default=False, help="Whether to merge validation and test sets for evaluation")
+        parser.add_argument("--use-esm2", action="store_true", default=False, help="Condition on frozen ESM-2 protein embeddings (factor A).")
+        parser.add_argument("--use-chemberta", action="store_true", default=False, help="Condition on frozen ChemBERTa ligand embeddings (factor B).")
+        parser.add_argument("--embeddings-dir", type=str, default="data/embeddings", help="Dir with cached embeddings and mapping jsons.")
+        parser.add_argument("--esm2-model", type=str, default="esm2-650M", help="ESM-2 model key used for cached protein embeddings.")
         # fmt: on
 
         return parent_parser
@@ -125,6 +139,7 @@ class PDBbind(pl.LightningDataModule):
         protein_mols = []
         ligand_mols = []
         labels = []
+        sample_ids = []
 
         for protein_file, ligand_file in zip(protein_files, ligand_files):
             if os.path.exists(os.path.join(self.root_dir, protein_file)) and os.path.exists(
@@ -132,6 +147,7 @@ class PDBbind(pl.LightningDataModule):
             ):
                 protein_mols.append(pickle.load(open(os.path.join(self.root_dir, protein_file), "rb")))
                 ligand_mols.append(pickle.load(open(os.path.join(self.root_dir, ligand_file), "rb")))
+                sample_ids.append(str(protein_file.split("_")[0]))
 
         # exclude atoms outside the box
         for i, ptn in enumerate(protein_mols):
@@ -145,6 +161,8 @@ class PDBbind(pl.LightningDataModule):
             ptn.element_symbols = ptn.element_symbols[inside_atoms_idx]
 
             labels.append(dataset.delta_g.values[i])
+
+        e_prot, e_lig = self._load_embeddings(sample_ids)
 
         # apply molecular dropout view
         voxel_grid = self.voxel_grid
@@ -163,9 +181,43 @@ class PDBbind(pl.LightningDataModule):
             voxel=voxel_grid,
             transform=self.transforms if split == "train" else None,
             molecular_dropout=self.molecular_dropout if split == "train" else 0.0,
+            e_prot=e_prot,
+            e_lig=e_lig,
         )
 
         return data
+
+    def _load_embeddings(self, sample_ids):
+        """Return (e_prot_list, e_lig_list) aligned with sample_ids, or (None, None).
+
+        e_prot: per-sample ESM-2 vector (or None for that sample) from the cache.
+        e_lig: per-sample ChemBERTa vector (or None for that sample) from the cache.
+        Missing entities yield None so the dataloader can still batch the sample.
+        """
+        if not (self.use_esm2 or self.use_chemberta):
+            return None, None
+
+        ed = self.embeddings_dir
+        c2s = json.load(open(os.path.join(ed, "complex_to_seq.json"))) if self.use_esm2 else {}
+        c2sm = json.load(open(os.path.join(ed, "complex_to_smiles.json"))) if self.use_chemberta else {}
+
+        def _load(path):
+            return np.load(path) if path is not None else None
+
+        e_prot = None
+        e_lig = None
+        if self.use_esm2:
+            e_prot = [
+                _load(os.path.join(ed, "esm2", self.esm2_model, f"{c2s.get(cid)}.npy") if c2s.get(cid) else None)
+                for cid in sample_ids
+            ]
+        if self.use_chemberta:
+            e_lig = [
+                _load(os.path.join(ed, "chemberta", f"{hashlib.sha1(c2sm[cid].encode()).hexdigest()[:16]}.npy")
+                      if c2sm.get(cid) else None)
+                for cid in sample_ids
+            ]
+        return e_prot, e_lig
 
     def train_dataloader(self):
         return torch.utils.data.DataLoader(
@@ -201,9 +253,15 @@ class VoxelDataset(Dataset):
         molecular_dropout: float = 0.0,
         rng: np.random.Generator = np.random.default_rng(),
         root_dir: str = "",
+        e_prot: Optional[list] = None,
+        e_lig: Optional[list] = None,
     ):
         assert len(protein_files) == len(ligand_files), "must have the same length!"
         assert len(protein_files) == len(labels), "must have the same length!"
+        if e_prot is not None:
+            assert len(e_prot) == len(labels), "e_prot must be aligned with labels!"
+        if e_lig is not None:
+            assert len(e_lig) == len(labels), "e_lig must be aligned with labels!"
 
         self.ptn_files = protein_files
         self.lig_files = ligand_files
@@ -214,6 +272,8 @@ class VoxelDataset(Dataset):
         self.transform = transform
         self.molecular_dropout = molecular_dropout
         self.rng = rng
+        self.e_prot = e_prot
+        self.e_lig = e_lig
 
     def __len__(self) -> int:
         return len(self.labels)
@@ -245,4 +305,8 @@ class VoxelDataset(Dataset):
             if isinstance(transform, Random90DegreesRotation):
                 voxs = transform(voxs)
 
+        if self.e_prot is not None or self.e_lig is not None:
+            e_prot = self.e_prot[idx] if self.e_prot is not None else None
+            e_lig = self.e_lig[idx] if self.e_lig is not None else None
+            return voxs, e_prot, e_lig, label
         return voxs, label
