@@ -30,6 +30,7 @@ class PDBbind(pl.LightningDataModule):
         protein_path_pattern: str = "{c}_protein_prep.pdb.pkl",
         ligand_path_pattern: str = "{c}_ligand_rnum.pdb.pkl",
         split_column: str = "random_split",  # Column name in the dataframe used to select train/validation/test splits
+        target_column: str = "pki",  # Regression label: pK (pKd/pKi/pIC50). See configs/grid/README.md.
         merge_val_test: bool = False,
         num_workers: int = 4,
         use_esm2: bool = False,
@@ -50,6 +51,7 @@ class PDBbind(pl.LightningDataModule):
         self.protein_path_pattern = protein_path_pattern
         self.ligand_path_pattern = ligand_path_pattern
         self.split_column = split_column
+        self.target_column = target_column
         self.merge_val_test = merge_val_test
         self.num_workers = num_workers
         self.use_esm2 = use_esm2
@@ -74,6 +76,7 @@ class PDBbind(pl.LightningDataModule):
         parser.add_argument("--protein-path-pattern", type=str, default="{c}_protein_prep.pdb.pkl", help="Path pattern for protein files, use {c} as placeholder for PDB ID")
         parser.add_argument("--ligand-path-pattern", type=str, default="{c}_ligand_rnum.pdb.pkl", help="Path pattern for ligand files, use {c} as placeholder for PDB ID")
         parser.add_argument("--split-column", type=str, default="random_split", help="Column name in the dataframe used to select train/validation/test splits")
+        parser.add_argument("--target-column", type=str, default="pki", help="Regression label column: 'pki' (pK units, default) or 'delta_g' (kcal/mol). delta_g = -RT*ln(10)*pK, so they differ only by a factor of -1.364.")
         parser.add_argument("--merge-val-test", action="store_true", default=False, help="Whether to merge validation and test sets for evaluation")
         parser.add_argument("--use-esm2", action="store_true", default=False, help="Condition on frozen ESM-2 protein embeddings (factor A).")
         parser.add_argument("--use-chemberta", action="store_true", default=False, help="Condition on frozen ChemBERTa ligand embeddings (factor B).")
@@ -99,6 +102,8 @@ class PDBbind(pl.LightningDataModule):
     def _split_dataset(self, split: str) -> Dataset:
         if self.split_column not in self.df.columns:
             raise ValueError(f"Split column '{self.split_column}' not found in dataframe.")
+        if self.target_column not in self.df.columns:
+            raise ValueError(f"Target column '{self.target_column}' not found in dataframe.")
         if self.split_column == "coreset_v2016":
             if split == "train":
                 dataset = self.df[((self.df['random_split'] == "train") 
@@ -143,7 +148,7 @@ class PDBbind(pl.LightningDataModule):
 
         # o rotulo e coletado aqui, no mesmo laco que aceita a amostra, para ficar
         # alinhado com protein_mols/ligand_mols/sample_ids quando algum pickle falta
-        for protein_file, ligand_file, label in zip(protein_files, ligand_files, dataset.delta_g.values):
+        for protein_file, ligand_file, label in zip(protein_files, ligand_files, dataset[self.target_column].values):
             if os.path.exists(os.path.join(self.root_dir, protein_file)) and os.path.exists(
                 os.path.join(self.root_dir, ligand_file)
             ):

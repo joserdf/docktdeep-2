@@ -3,9 +3,9 @@
 
 Samples a handful of complexes per split from the full index, keeping only
 complexes whose protein and ligand voxelization pickles exist in ``processed/``.
-The output CSV has the columns the datamodule actually uses: ``id``, ``delta_g``
-and the split column (``random_split``). This keeps M1 sanity runs fast and
-reproducible without touching the 22 GB dataset.
+The output CSV has the columns the datamodule actually uses: ``id``, the target
+column (``pki``, in pK units) and the split column (``random_split``). This keeps
+M1 sanity runs fast and reproducible without touching the 22 GB dataset.
 """
 
 import argparse
@@ -40,6 +40,8 @@ def parse_args():
     p.add_argument("--test", type=int, default=4)
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--split-column", type=str, default="random_split")
+    p.add_argument("--target-column", type=str, default="pki",
+                   help="Regression label column to carry over (default: pki, in pK units).")
     p.add_argument(
         "--protein-pattern", type=str, default="{c}_protein_prep.pdb.pkl"
     )
@@ -77,7 +79,7 @@ def main():
     sanity = pd.concat(parts)
     cols = [
         c
-        for c in ["id", "delta_g", args.split_column]
+        for c in ["id", args.target_column, args.split_column]
         if c in sanity.columns
     ]
     sanity = sanity[cols]
