@@ -141,13 +141,16 @@ class PDBbind(pl.LightningDataModule):
         labels = []
         sample_ids = []
 
-        for protein_file, ligand_file in zip(protein_files, ligand_files):
+        # o rotulo e coletado aqui, no mesmo laco que aceita a amostra, para ficar
+        # alinhado com protein_mols/ligand_mols/sample_ids quando algum pickle falta
+        for protein_file, ligand_file, label in zip(protein_files, ligand_files, dataset.delta_g.values):
             if os.path.exists(os.path.join(self.root_dir, protein_file)) and os.path.exists(
                 os.path.join(self.root_dir, ligand_file)
             ):
                 protein_mols.append(pickle.load(open(os.path.join(self.root_dir, protein_file), "rb")))
                 ligand_mols.append(pickle.load(open(os.path.join(self.root_dir, ligand_file), "rb")))
                 sample_ids.append(str(protein_file.split("_")[0]))
+                labels.append(label)
 
         # exclude atoms outside the box
         for i, ptn in enumerate(protein_mols):
@@ -159,8 +162,6 @@ class PDBbind(pl.LightningDataModule):
             # keep only the atoms inside the binding pocket, rewrite the MolecularData attributes
             ptn.coords = ptn.coords[:, inside_atoms_idx]
             ptn.element_symbols = ptn.element_symbols[inside_atoms_idx]
-
-            labels.append(dataset.delta_g.values[i])
 
         e_prot, e_lig = self._load_embeddings(sample_ids)
 

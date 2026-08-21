@@ -84,7 +84,7 @@ class Baseline(pl.LightningModule):
         self.loss_fn = torch.nn.MSELoss() # Try: L1Loss, SmoothL1Loss, HuberLoss
         self.mae = MeanAbsoluteError()
         self.validation_step_outputs = []
-        self.test_set_outputs = []
+        self.test_step_outputs = []
         self.validation_logs = []
 
         use_esm2 = bool(self.hparams.get("use_esm2", False))

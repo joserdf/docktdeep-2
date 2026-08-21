@@ -107,7 +107,7 @@ class STN(pl.LightningModule):
         self.save_hyperparameters()
         self.loss_fn = torch.nn.MSELoss()
         self.validation_step_outputs = []
-        self.test_set_outputs = []
+        self.test_step_outputs = []
         self.validation_logs = []
 
         self.localization = LocalizationNet(input_size, hparams=self.hparams)
