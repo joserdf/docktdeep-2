@@ -20,13 +20,16 @@ mean-pooled (spec 01: frozen features, attention pooling is the alternative).
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
 import torch
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 MODELS = {
-    "esm2-3B": ("facebook/esm2_t36_3B_UR50D", 2560),
+    # esm2-3B (~3B, 2560-d) needs ~24GB VRAM with long sequences -> diamante GPU.
     "esm2-650M": ("facebook/esm2_t33_650M_UR50D", 1280),
     "esm2-150M": ("facebook/esm2_t30_150M_UR50D", 640),
     "esm2-35M": ("facebook/esm2_t12_35M_UR50D", 480),
@@ -44,6 +47,8 @@ def parse_args():
                    help="torch device; default = cuda if available else cpu.")
     p.add_argument("--limit", type=int, default=None,
                    help="Limit number of sequences (sanity).")
+    p.add_argument("--max-length", type=int, default=1024,
+                   help="Truncate sequences longer than this (ESM-2 supports up to 1022 tokens).")
     return p.parse_args()
 
 
@@ -81,16 +86,18 @@ def main():
         tok = AutoTokenizer.from_pretrained(model_id)
         model = AutoModel.from_pretrained(model_id)
         model.to(device).eval()
-        if device == "cuda":
-            model = model.half() if key == "esm2-3B" else model.to(torch.float32)
+        use_amp = device == "cuda"
+        dtype = torch.float16 if use_amp else torch.float32
         with torch.no_grad():
             for h, seq in seqs:
                 out_file = out_dir / f"{h}.npy"
                 if out_file.exists():
                     continue
-                inp = tok([seq], return_tensors="pt", padding=True, truncation=True).to(device)
-                out = model(**inp).last_hidden_state
-                # mean pool over real tokens (ignore padding)
+                inp = tok([seq], return_tensors="pt", padding=True,
+                          truncation=True, max_length=args.max_length).to(device)
+                with torch.autocast(device_type="cuda", dtype=dtype, enabled=use_amp):
+                    out = model(**inp).last_hidden_state
+                out = out.float()  # upcast before pooling for numeric stability
                 mask = inp["attention_mask"].unsqueeze(-1).float()
                 pooled = (out * mask).sum(1) / mask.sum(1)
                 pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
