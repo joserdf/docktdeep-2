@@ -129,7 +129,8 @@ class PDBbind(pl.LightningDataModule):
                 dataset = self.df[self.df[self.split_column] == False]
             else:
                 dataset = self.df[self.df[self.split_column] == True]
-        elif ["train", "validation", "test"] in self.df[self.split_column].unique():
+        elif {"train", "validation", "test"}.issubset(
+                set(self.df[self.split_column].dropna().astype(str).unique())):
             dataset = self.df[self.df[self.split_column] == split]
         else:
             raise ValueError(f"Unexpected values in split column '{self.split_column}'.")
