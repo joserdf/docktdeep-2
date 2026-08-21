@@ -173,6 +173,8 @@ class Baseline(pl.LightningModule):
         self.label_smoothing = float(self.hparams.get("label_smoothing", 0.0))
         self.lambda_semi = float(self.hparams.get("lambda_semi", 1.0))
         self.tau = float(self.hparams.get("semi_tau", 0.1))
+        self.yaware = bool(self.hparams.get("yaware", False))
+        self.yaware_sigma = float(self.hparams.get("yaware_sigma", 1.0))
 
     def forward(self, x, e_prot=None, e_lig=None):
         x = self.conv_layers(x)
@@ -214,6 +216,8 @@ class Baseline(pl.LightningModule):
         parser.add_argument("--lambda-semi", type=float, default=1.0, help="Weight of L_semi in the total loss.")
         parser.add_argument("--proj-dim", type=int, default=128, help="Projection head p(f) output dim (factor C).")
         parser.add_argument("--semi-tau", type=float, default=0.1, help="Temperature for contrastive L_semi.")
+        parser.add_argument("--yaware", action="store_true", default=False, help="Use y-aware InfoNCE (anchored on affinity) instead of embedding-anchored contrastive.")
+        parser.add_argument("--yaware-sigma", type=float, default=1.0, help="Affinity distance scale (pKd) for y-aware positive weights.")
         # fmt: on
         return parent_parser
 
@@ -226,12 +230,30 @@ class Baseline(pl.LightningModule):
             weight_decay=self.hparams.wdecay,
         )
 
-    def _semi_loss(self, x, e_prot, e_lig):
-        """L_semi (factor C): consistency (R-Drop) + optional contrastive InfoNCE."""
+    def _yaware_infonce(self, p, y):
+        """Soft InfoNCE anchored on the affinity labels themselves.
+
+        Samples with close pKd act as soft positives; far ones as negatives. This
+        shapes p(f) so that projection-space proximity mirrors affinity ordering.
+        """
+        B = p.shape[0]
+        sim = p @ p.T / self.tau  # (B, B) embedding similarity
+        d = torch.abs(y[:, None] - y[None, :])  # (B, B) affinity distance
+        tgt = torch.exp(-d / self.yaware_sigma) * (1.0 - torch.eye(B, device=p.device))
+        tgt = tgt / (tgt.sum(dim=1, keepdim=True) + 1e-8)  # normalize rows, self excluded
+        log_softmax = torch.log_softmax(sim, dim=1)
+        return -(tgt * log_softmax).sum(dim=1).mean()
+
+    def _semi_loss(self, x, e_prot, e_lig, y):
+        """L_semi (factor C): consistency (R-Drop) + contrastive (y-aware or embedding-anchored)."""
         self.train()  # enable dropout for stochastic passes
         p1 = F.normalize(self.proj_head(self.forward_base_f(x, e_prot, e_lig)), dim=1)
         p2 = F.normalize(self.proj_head(self.forward_base_f(x, e_prot, e_lig)), dim=1)
         loss = F.mse_loss(p1, p2)  # consistency: align p(f) under two stochastic passes
+
+        if self.yaware:
+            loss = loss + self._yaware_infonce(p1, y)
+            return loss
 
         parts = []
         if self.proj_prot is not None and e_prot is not None:
@@ -271,7 +293,7 @@ class Baseline(pl.LightningModule):
             y_target = y_target * (1.0 - self.label_smoothing) + y_target.mean() * self.label_smoothing
         loss = self.loss_fn(y_pred, y_target)
         if self.proj_head is not None and stage == "train":
-            semi = self._semi_loss(x, e_prot, e_lig)
+            semi = self._semi_loss(x, e_prot, e_lig, y)
             loss = loss + self.lambda_semi * semi
             self.log("train_semi", semi.detach(), **log_params)
         self.log(f"{stage}_loss", loss, **log_params)
