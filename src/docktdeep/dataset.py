@@ -67,6 +67,7 @@ class PDBbind(pl.LightningDataModule):
         parser.add_argument("--num-workers", type=int, default=4)
         parser.add_argument("--vox-size", type=float, default=1.0)
         parser.add_argument("--box-dims", type=list, default=[24.0, 24.0, 24.0])
+        parser.add_argument("--voxel-device", type=str, default="cpu", help="Device for voxelization. Keep 'cpu': DataLoader workers under start method 'fork' cannot re-initialize CUDA. 'cuda' only makes sense with --num-workers 0.")
         parser.add_argument("--view", nargs="+", type=str, default=["VolumeView", "BasicView"])
         parser.add_argument("--occupancy", type=str, default="vdw", help="Type of occupancy to use in voxelization: vdw or gaussian")
         parser.add_argument("--random-rotation", action="store_true", default=False)

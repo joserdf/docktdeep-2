@@ -70,6 +70,7 @@ def configure_voxel_grid(args):
         box_dims=args.box_dims,
         views=views,
         occupancy=args.occupancy,
+        device=args.voxel_device,
     )
 
 
@@ -178,10 +179,17 @@ def parse_args():
     return args
 
 if __name__ == "__main__":
-    # DataLoader workers + CUDA require 'spawn' on Linux (fork re-inits CUDA).
+    # DataLoader workers do CPU-only work (pickle load, voxelization) while the
+    # model stays on GPU in the main process. We use 'fork' so the workers
+    # inherit the (large, up-to-GB) in-memory dataset via copy-on-write instead
+    # of being serialized over a pipe (spawn deadlocks on the full 17k dataset).
+    # This is only safe because --voxel-device defaults to 'cpu': docktgrid
+    # otherwise allocates the voxel grid on cuda (docktgrid.config.DEVICE), and
+    # a forked child cannot re-initialize CUDA. Do not pass --voxel-device cuda
+    # together with --num-workers > 0.
     import multiprocessing
     try:
-        multiprocessing.set_start_method("spawn", force=True)
+        multiprocessing.set_start_method("fork", force=True)
     except RuntimeError:
         pass
     args = parse_args()

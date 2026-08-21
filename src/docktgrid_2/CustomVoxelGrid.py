@@ -1,12 +1,50 @@
 import torch
 
-from docktgrid.config import DEVICE
+from docktgrid.config import DTYPE
 from docktgrid import VoxelGrid
 
 
 class CustomVoxelGrid(VoxelGrid):
-    def __init__(self, *args, **kwargs):
+    """VoxelGrid com occupancies extras e device de voxelizacao configuravel.
+
+    O docktgrid original aloca tudo em ``docktgrid.config.DEVICE`` (cuda quando
+    disponivel). Isso quebra os workers do DataLoader sob start method 'fork':
+    ``Cannot re-initialize CUDA in forked subprocess``. Como grid points e
+    coords da molecula ja sao CPU, voxelizar em CPU no worker e mover o batch
+    para a GPU no laco de treino e o caminho natural -- e paraleliza pelos
+    num_workers em vez de serializar numa unica GPU.
+    """
+
+    def __init__(self, *args, device="cpu", **kwargs):
         super().__init__(*args, **kwargs)
+        self.device = torch.device(device)
+
+    def voxelize(self, molecule, out=None, channels=None, requires_grad=False):
+        """Igual ao da classe base, mas alocando em ``self.device``.
+
+        Nao da para delegar via ``super().voxelize(out=...)``: a base passa o
+        ``out`` recebido por ``torch.as_tensor(out, DTYPE, DEVICE)``, o que o
+        moveria de volta para a GPU.
+        """
+        if out is None:
+            out = torch.zeros(
+                self.shape, dtype=DTYPE, device=self.device, requires_grad=requires_grad
+            )
+        else:
+            out = torch.as_tensor(out, dtype=DTYPE, device=self.device)
+            if out.shape != self.shape:
+                raise ValueError(f"`out` shape must be == {self.shape}, got {out.shape}")
+
+        if channels is None:
+            channels = self.get_channels_mask(molecule)
+        else:
+            cshape = (self.num_channels, molecule.n_atoms)
+            if channels.shape != cshape:
+                raise ValueError(f"`channels` shape must be == {cshape}, got {channels.shape}")
+        channels = channels.to(self.device)
+
+        self.occupancy_func(molecule, out, channels)
+        return out.view(self.shape)
 
     def get_occupancy_func(self, occ):
         if occ == 'gaussian':
@@ -19,6 +57,34 @@ class CustomVoxelGrid(VoxelGrid):
             return self._voxelize_vdw2_matmul
         else:
             return super().get_occupancy_func(occ)
+
+    @torch.no_grad()
+    def _voxelize_vdw(self, molecule, out, channels) -> None:
+        """Igual ao da base, mas em ``self.device``.
+
+        A base manda coords/grid/raios para ``docktgrid.config.DEVICE`` (cuda)
+        enquanto o nosso ``out`` esta em ``self.device``, e o kernel jit falha
+        com device mismatch. Esta e a unica occupancy que nao sobrescrevemos
+        por outro motivo, entao precisa da copia.
+        """
+        points = self.grid.points
+        center = molecule.ligand_center
+        grid = [(u + v).unsqueeze(-1) for u, v in zip(points, center)]
+
+        x, y, z = 0, 1, 2
+        out = out.view(channels.shape[0], grid[x].shape[0])
+
+        self._calc_vdw_occupancies(
+            out,
+            channels,
+            molecule.coords[x].to(self.device),
+            molecule.coords[y].to(self.device),
+            molecule.coords[z].to(self.device),
+            grid[x].to(self.device),
+            grid[y].to(self.device),
+            grid[z].to(self.device),
+            molecule.vdw_radii.to(self.device),
+        )
         
     @torch.no_grad()
     def _voxelize_gaussian(self, molecule, out, channels) -> None:
@@ -34,14 +100,14 @@ class CustomVoxelGrid(VoxelGrid):
         # channels is now a tensor of property values per channel/atom
         self._calc_gaussian_occupancies(
             out,
-            channels.to(DEVICE),
-            molecule.coords[x].to(DEVICE),
-            molecule.coords[y].to(DEVICE),
-            molecule.coords[z].to(DEVICE),
-            grid[x].to(DEVICE),
-            grid[y].to(DEVICE),
-            grid[z].to(DEVICE),
-            molecule.vdw_radii.to(DEVICE),
+            channels.to(self.device),
+            molecule.coords[x].to(self.device),
+            molecule.coords[y].to(self.device),
+            molecule.coords[z].to(self.device),
+            grid[x].to(self.device),
+            grid[y].to(self.device),
+            grid[z].to(self.device),
+            molecule.vdw_radii.to(self.device),
         )
     
     @staticmethod
@@ -90,14 +156,14 @@ class CustomVoxelGrid(VoxelGrid):
         # channels is now a tensor of property values per channel/atom
         self._calc_gaussian_amax_occupancies(
             out,
-            channels.to(DEVICE),
-            molecule.coords[x].to(DEVICE),
-            molecule.coords[y].to(DEVICE),
-            molecule.coords[z].to(DEVICE),
-            grid[x].to(DEVICE),
-            grid[y].to(DEVICE),
-            grid[z].to(DEVICE),
-            molecule.vdw_radii.to(DEVICE),
+            channels.to(self.device),
+            molecule.coords[x].to(self.device),
+            molecule.coords[y].to(self.device),
+            molecule.coords[z].to(self.device),
+            grid[x].to(self.device),
+            grid[y].to(self.device),
+            grid[z].to(self.device),
+            molecule.vdw_radii.to(self.device),
         )
     
     @staticmethod
@@ -154,14 +220,14 @@ class CustomVoxelGrid(VoxelGrid):
         # channels is now a tensor of property values per channel/atom
         self._calc_vdw2_occupancies(
             out,
-            channels.to(DEVICE),
-            molecule.coords[x].to(DEVICE),
-            molecule.coords[y].to(DEVICE),
-            molecule.coords[z].to(DEVICE),
-            grid[x].to(DEVICE),
-            grid[y].to(DEVICE),
-            grid[z].to(DEVICE),
-            molecule.vdw_radii.to(DEVICE),
+            channels.to(self.device),
+            molecule.coords[x].to(self.device),
+            molecule.coords[y].to(self.device),
+            molecule.coords[z].to(self.device),
+            grid[x].to(self.device),
+            grid[y].to(self.device),
+            grid[z].to(self.device),
+            molecule.vdw_radii.to(self.device),
         )
     
     @staticmethod
@@ -219,14 +285,14 @@ class CustomVoxelGrid(VoxelGrid):
         # channels is now a tensor of property values per channel/atom
         self._calc_vdw2_matmul_occupancies(
             out,
-            channels.to(DEVICE),
-            molecule.coords[x].to(DEVICE),
-            molecule.coords[y].to(DEVICE),
-            molecule.coords[z].to(DEVICE),
-            grid[x].to(DEVICE),
-            grid[y].to(DEVICE),
-            grid[z].to(DEVICE),
-            molecule.vdw_radii.to(DEVICE),
+            channels.to(self.device),
+            molecule.coords[x].to(self.device),
+            molecule.coords[y].to(self.device),
+            molecule.coords[z].to(self.device),
+            grid[x].to(self.device),
+            grid[y].to(self.device),
+            grid[z].to(self.device),
+            molecule.vdw_radii.to(self.device),
         )
     
     @staticmethod
