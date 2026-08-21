@@ -10,6 +10,7 @@ command_flags:
   use_esm2: false
   use_chemberta: true
   semi: true
+  yaware: true
 
 model: Baseline
 
@@ -17,6 +18,7 @@ data:
   dataframe_path: data/pdbbind2020/index-pfam.csv
   root_dir: data/pdbbind2020/processed
   split_column: random_split
+  target_column: pki   # rotulo em unidades de pK; delta_g = -1.364*pK
   merge_val_test: true
   protein_path_pattern: "{c}_protein_prep.pdb.pkl"
   ligand_path_pattern: "{c}_ligand_rnum.pdb.pkl"

@@ -47,13 +47,37 @@ python train.py \
   --protein-path-pattern "{c}_protein_prep.pdb.pkl" \
   --ligand-path-pattern "{c}_ligand_rnum.pdb.pkl" \
   --split-column random_split \
+  --target-column pki \
   --merge-val-test
 ```
 
-- Label da regressão: `delta_g` (coluna do índice; média ≈ −8.67, range −20.8…−0.5).
 - Aim remoto: `--remote` + env `AIM_REPO=aim://<host>:43800` (ver broker).
 - Sanity (M1): reduzir `--max-epochs 2`, `--batch-size 16`, e usar um `index-pfam.csv`
   reduzido (ver `tools/make_sanity_index.py`).
+
+### Label da regressão: `pki` (unidades de pK)
+
+O índice traz o mesmo alvo em duas colunas, ligadas pela identidade termodinâmica
+ΔG = −RT·ln(10)·pK:
+
+| coluna | unidade | média | dp | range |
+|--------|---------|-------|-----|-------|
+| `pki` | pK (pKd/pKi/pIC50) | 6.36 | 1.86 | 0.40 … 15.22 |
+| `delta_g` | kcal/mol | −8.67 | 2.53 | −20.76 … −0.54 |
+
+Medido no `index-pfam.csv`: `delta_g/pki = −1.36355` (dp 7.3e−04), contra
+−RT·ln(10) = −1.36425 a 298.15 K, com Pearson r = −0.999999. São **a mesma
+variável reescalada**, então a escolha não muda o que o modelo consegue aprender
+(Pearson e Spearman são idênticos); muda o que os números significam:
+
+- **Comparabilidade:** KDEEP, Pafnucy, OnionNet e IGN/GraphBAR reportam RMSE em
+  unidades de pK. Reportar RMSE em ΔG ao lado deles infla o número em 36%.
+- **Hiperparâmetros com escala:** `--huber-beta` e `--yaware-sigma` são distâncias
+  nas unidades do rótulo. Com `pki`, `1.0` ≈ 0.54 dp — uma década de afinidade.
+
+Por isso o default é `--target-column pki`. Para reproduzir experimentos antigos,
+passe `--target-column delta_g` (as métricas de correlação batem; o RMSE sai
+multiplicado por 1.364 e o sinal da predição inverte).
 
 ## Status de implementação por arranjo
 
@@ -70,7 +94,9 @@ python train.py \
 
 > Todos os arranjos executáveis desde M4 (março de M2-M4). Embeddings pré-computados em
 > `data/embeddings/` (ESM-2 650M/150M/35M/8M + ChemBERTa). Flags de fator C: `--semi`,
-> `--loss huber`, `--label-smoothing`, `--lambda-semi`. Ver `tools/*.py`.
+> `--yaware` (contrastivo ancorado na afinidade), `--loss huber`, `--label-smoothing`,
+> `--lambda-semi`. Arranjos 5-8 usam `--yaware` (InfoNCE inspirado na própria afinidade,
+> independe de embeddings). Ver `tools/*.py`.
 
 > Hipóteses: mesmo corpus, splits e seeds em todos os arranjos (spec 05); ≥3 seeds por
 > config; média ± IC no relatório (PLAN.md §7, §8, §9).
