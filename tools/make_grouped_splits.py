@@ -63,12 +63,43 @@ def parse_args():
     p.add_argument("--val-frac", type=float, default=0.18,
                    help="Fraction of each outer training pool reserved as a grouped "
                         "validation slice.")
+    p.add_argument("--require-embeddings", type=Path, default=None,
+                   help="Embeddings dir. When given, keep only complexes that have BOTH an "
+                        "ESM-2 and a ChemBERTa vector on disk. Without this the 2^3 grid is "
+                        "confounded: dataset.py silently drops samples missing a required "
+                        "embedding, so arrangements with ChemBERTa would train on a smaller "
+                        "corpus than those without, violating PLAN.md section 7.")
+    p.add_argument("--esm2-model", type=str, default="esm2-650M")
     p.add_argument("--mega-cluster", type=str, default=MEGA_DEFAULT,
                    help="Cluster too large to balance; kept out of the hold-out and "
                         "out of every validation slice, and given its own outer fold. "
                         "Pass '' to disable the special case.")
     p.add_argument("--seed", type=int, default=7)
     return p.parse_args()
+
+
+def has_both_embeddings(ids, emb_dir, esm2_model):
+    """Mask of complexes that have an ESM-2 *and* a ChemBERTa vector on disk.
+
+    Mirrors the lookup in ``PDBbind._load_embeddings``: proteins are keyed by
+    sequence id, ligands by a sha1 prefix of the canonical SMILES.
+    """
+    import hashlib
+    import json
+
+    emb_dir = Path(emb_dir)
+    c2s = json.loads((emb_dir / "complex_to_seq.json").read_text())
+    c2sm = json.loads((emb_dir / "complex_to_smiles.json").read_text())
+
+    def ok(cid):
+        seq, smi = c2s.get(cid), c2sm.get(cid)
+        if not seq or not smi:
+            return False
+        digest = hashlib.sha1(smi.encode()).hexdigest()[:16]
+        return ((emb_dir / "esm2" / esm2_model / f"{seq}.npy").exists()
+                and (emb_dir / "chemberta" / f"{digest}.npy").exists())
+
+    return ids.map(ok)
 
 
 def greedy_partition(sizes, k, rng):
@@ -116,6 +147,8 @@ def main():
     keep = df.grp_cluster.notna() & (df.random_split != "ERR") & (~df.covalent)
     if args.cl1:
         keep &= df.CL1
+    if args.require_embeddings:
+        keep &= has_both_embeddings(df.id, args.require_embeddings, args.esm2_model)
     pop = df[keep]
     sizes = pop.groupby("grp_cluster").size().to_dict()
     print(f"population: {len(pop)} complexes in {len(sizes)} clusters "
