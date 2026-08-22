@@ -37,6 +37,7 @@ class PDBbind(pl.LightningDataModule):
         use_chemberta: bool = False,
         embeddings_dir: str = "data/embeddings",
         esm2_model: str = "esm2-650M",
+        no_cnn: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -58,6 +59,7 @@ class PDBbind(pl.LightningDataModule):
         self.use_chemberta = use_chemberta
         self.embeddings_dir = embeddings_dir
         self.esm2_model = esm2_model
+        self.no_cnn = no_cnn
 
     @staticmethod
     def add_specific_args(parent_parser):
@@ -154,13 +156,17 @@ class PDBbind(pl.LightningDataModule):
             if os.path.exists(os.path.join(self.root_dir, protein_file)) and os.path.exists(
                 os.path.join(self.root_dir, ligand_file)
             ):
-                protein_mols.append(pickle.load(open(os.path.join(self.root_dir, protein_file), "rb")))
-                ligand_mols.append(pickle.load(open(os.path.join(self.root_dir, ligand_file), "rb")))
+                if self.no_cnn:  # placeholders: o grid nunca e construido
+                    protein_mols.append(None)
+                    ligand_mols.append(None)
+                else:
+                    protein_mols.append(pickle.load(open(os.path.join(self.root_dir, protein_file), "rb")))
+                    ligand_mols.append(pickle.load(open(os.path.join(self.root_dir, ligand_file), "rb")))
                 sample_ids.append(str(protein_file.split("_")[0]))
                 labels.append(label)
 
         # exclude atoms outside the box
-        for i, ptn in enumerate(protein_mols):
+        for i, ptn in enumerate([] if self.no_cnn else protein_mols):
             radius = np.ceil(np.sqrt(3) * max(self.voxel_grid.shape[1:]) / 2)
             inside_atoms_idx = docktgrid.molparser.extract_binding_pocket(
                 ptn.coords, ligand_mols[i].coords.mean(dim=1), radius
@@ -207,6 +213,7 @@ class PDBbind(pl.LightningDataModule):
             molecular_dropout=self.molecular_dropout if split == "train" else 0.0,
             e_prot=e_prot,
             e_lig=e_lig,
+            skip_voxel=self.no_cnn,
         )
 
         return data
@@ -307,6 +314,7 @@ class VoxelDataset(Dataset):
         root_dir: str = "",
         e_prot: Optional[list] = None,
         e_lig: Optional[list] = None,
+        skip_voxel: bool = False,
     ):
         assert len(protein_files) == len(ligand_files), "must have the same length!"
         assert len(protein_files) == len(labels), "must have the same length!"
@@ -326,11 +334,20 @@ class VoxelDataset(Dataset):
         self.rng = rng
         self.e_prot = e_prot
         self.e_lig = e_lig
+        self.skip_voxel = skip_voxel
 
     def __len__(self) -> int:
         return len(self.labels)
 
     def __getitem__(self, idx):
+        if self.skip_voxel:
+            # ablacao --no-cnn: o modelo ignora `voxs`, entao nem o complexo nem o
+            # grid sao construidos. Devolve um placeholder so para manter a forma
+            # da tupla que o _collate espera.
+            voxs = torch.zeros(1, dtype=torch.float32)
+            return voxs, self.e_prot[idx] if self.e_prot is not None else None, \
+                self.e_lig[idx] if self.e_lig is not None else None, self.labels[idx]
+
         molecule = docktgrid.molecule.MolecularComplex(
             self.ptn_files[idx], self.lig_files[idx], self.molparser, self.root_dir
         )

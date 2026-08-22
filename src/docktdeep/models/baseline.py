@@ -90,31 +90,46 @@ class Baseline(pl.LightningModule):
         use_esm2 = bool(self.hparams.get("use_esm2", False))
         use_chemberta = bool(self.hparams.get("use_chemberta", False))
         semi = bool(self.hparams.get("semi", False))
+        no_cnn = bool(self.hparams.get("no_cnn", False))
         f_dim = int(self.hparams.get("f_dim", 512))
         emb_proj_dim = int(self.hparams.get("emb_proj_dim", 128))
         proj_dim = int(self.hparams.get("proj_dim", 128))
 
-        conv = ConvGroup if not self.hparams.depthwise_convs else ConvGroupDepthwise
-        conv1 = conv(input_size[0], 64, 5)
-        conv2 = conv(64, 128, 5)
-        conv3 = conv(128, 256, 5)
-        self.conv_layers = torch.nn.Sequential(conv1, conv2, conv3)
+        # `no_cnn` ablates the whole convolutional branch: the latent `f` then
+        # comes from the projected embeddings instead of the voxel grid, so the
+        # head, the semi head and the dataloader all lose the structural input.
+        self.no_cnn = no_cnn
+        if no_cnn:
+            if not (use_esm2 or use_chemberta):
+                raise ValueError("--no-cnn requires --use-esm2 and/or --use-chemberta: "
+                                 "without the CNN and without embeddings the model has no input.")
+            self.conv_layers = None
+            self.flatten = None
+            self.f_proj = None
+            base_dim = emb_proj_dim * (int(use_esm2) + int(use_chemberta))
+        else:
+            conv = ConvGroup if not self.hparams.depthwise_convs else ConvGroupDepthwise
+            conv1 = conv(input_size[0], 64, 5)
+            conv2 = conv(64, 128, 5)
+            conv3 = conv(128, 256, 5)
+            self.conv_layers = torch.nn.Sequential(conv1, conv2, conv3)
 
-        polling = torch.nn.AdaptiveAvgPool3d((2, 2, 2))
-        flatten = torch.nn.Flatten()
-        self.flatten = (
-            torch.nn.Sequential(polling, flatten)
-            if self.hparams.adaptive_pooling
-            else flatten
-        )
+            polling = torch.nn.AdaptiveAvgPool3d((2, 2, 2))
+            flatten = torch.nn.Flatten()
+            self.flatten = (
+                torch.nn.Sequential(polling, flatten)
+                if self.hparams.adaptive_pooling
+                else flatten
+            )
 
-        # compact deterministic latent `f`
-        flat_dim = 256 * (2**3 if self.hparams.adaptive_pooling else 3**3)
-        self.f_proj = torch.nn.Sequential(
-            torch.nn.Linear(flat_dim, f_dim, bias=False),
-            torch.nn.BatchNorm1d(f_dim),
-            torch.nn.ReLU(inplace=True),
-        )
+            # compact deterministic latent `f`
+            flat_dim = 256 * (2**3 if self.hparams.adaptive_pooling else 3**3)
+            self.f_proj = torch.nn.Sequential(
+                torch.nn.Linear(flat_dim, f_dim, bias=False),
+                torch.nn.BatchNorm1d(f_dim),
+                torch.nn.ReLU(inplace=True),
+            )
+            base_dim = f_dim
 
         # embedding conditioning projections (factors A / B)
         self.emb_proj_dim = emb_proj_dim
@@ -135,7 +150,8 @@ class Baseline(pl.LightningModule):
             )
 
         # prediction head over f (+ conditioned embeddings)
-        head_in = f_dim + (emb_proj_dim if use_esm2 else 0) + (emb_proj_dim if use_chemberta else 0)
+        head_in = base_dim if no_cnn else (
+            base_dim + (emb_proj_dim if use_esm2 else 0) + (emb_proj_dim if use_chemberta else 0))
         fc_units = list(self.hparams.num_fc_units)
         self.head = torch.nn.Sequential()
         prev = head_in
@@ -152,7 +168,7 @@ class Baseline(pl.LightningModule):
         self.proj_target = None
         if semi:
             self.proj_head = torch.nn.Sequential(
-                torch.nn.Linear(f_dim, proj_dim, bias=False),
+                torch.nn.Linear(base_dim, proj_dim, bias=False),
                 torch.nn.ReLU(inplace=True),
                 torch.nn.Dropout(0.1),  # stochasticity for R-Drop consistency
                 torch.nn.Linear(proj_dim, proj_dim, bias=False),
@@ -177,15 +193,12 @@ class Baseline(pl.LightningModule):
         self.yaware_sigma = float(self.hparams.get("yaware_sigma", 1.0))
 
     def forward(self, x, e_prot=None, e_lig=None):
-        x = self.conv_layers(x)
-        x = self.flatten(x)
-        f = self.f_proj(x)  # compact latent, exposed as attribute for the contrastive head
-        self.last_f = f
-
-        if self.proj_prot is not None and e_prot is not None:
-            f = torch.cat([f, self.proj_prot(e_prot)], dim=1)
-        if self.proj_lig is not None and e_lig is not None:
-            f = torch.cat([f, self.proj_lig(e_lig)], dim=1)
+        f = self.forward_base_f(x, e_prot, e_lig)
+        if not self.no_cnn:  # sem CNN o `f` ja e a concatenacao das projecoes
+            if self.proj_prot is not None and e_prot is not None:
+                f = torch.cat([f, self.proj_prot(e_prot)], dim=1)
+            if self.proj_lig is not None and e_lig is not None:
+                f = torch.cat([f, self.proj_lig(e_lig)], dim=1)
         return self.head(f)
 
     @staticmethod
@@ -210,6 +223,7 @@ class Baseline(pl.LightningModule):
         parser.add_argument("--f-dim", type=int, default=512, help="Dimension of the compact latent f.")
         parser.add_argument("--emb-proj-dim", type=int, default=128, help="Dimension of embedding conditioning projections.")
         parser.add_argument("--semi", action="store_true", default=False, help="Enable factor C: semi-supervised + regularizers.")
+        parser.add_argument("--no-cnn", action="store_true", default=False, help="Ablate the 3D CNN branch: predict from the frozen embeddings alone (requires --use-esm2 and/or --use-chemberta).")
         parser.add_argument("--loss", type=str, default="mse", choices=["mse", "huber"], help="Affinity regression loss.")
         parser.add_argument("--huber-beta", type=float, default=1.0, help="Huber loss beta (if --loss huber).")
         parser.add_argument("--label-smoothing", type=float, default=0.0, help="Shrink regression targets toward batch mean.")
@@ -269,7 +283,15 @@ class Baseline(pl.LightningModule):
 
     def forward_base_f(self, x, e_prot=None, e_lig=None):
         """Forward up to the base latent f (before embedding conditioning)."""
-        f = self.f_proj(self.flatten(self.conv_layers(x)))
+        if self.no_cnn:
+            parts = []
+            if self.proj_prot is not None and e_prot is not None:
+                parts.append(self.proj_prot(e_prot))
+            if self.proj_lig is not None and e_lig is not None:
+                parts.append(self.proj_lig(e_lig))
+            f = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+        else:
+            f = self.f_proj(self.flatten(self.conv_layers(x)))
         self.last_f = f
         return f
 
