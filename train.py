@@ -59,6 +59,13 @@ def run(args):
 
     trainer.fit(model, datamodule=data_module)
 
+    # Report on the held-out fold with the checkpoint that ModelCheckpoint
+    # selected on the (cluster-disjoint) validation slice. Skipped under
+    # --merge-val-test, where the datamodule aliases validation to test and
+    # testing would only re-report the selection metric.
+    if not args.merge_val_test:
+        trainer.test(model, datamodule=data_module, ckpt_path="best")
+
     return trainer
 
 

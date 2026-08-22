@@ -385,6 +385,7 @@ class Baseline(pl.LightningModule):
             {
                 "test_pearsonr": torch.corrcoef(torch.stack((preds, labels)))[0][1],
                 "test_loss": torch.stack([x["test_loss"] for x in out]).mean(),
+                "test_mae": self.mae(preds, labels),
             },
             prog_bar=True,
             logger=True,
