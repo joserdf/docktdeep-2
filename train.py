@@ -1,5 +1,6 @@
 import argparse
 import glob
+import json
 import os
 import subprocess
 import sys
@@ -66,7 +67,37 @@ def run(args):
     if not args.merge_val_test:
         trainer.test(model, datamodule=data_module, ckpt_path="best")
 
+    emit_metrics_line(trainer, model, args)
+
     return trainer
+
+
+def emit_metrics_line(trainer, model, args) -> None:
+    """Imprime a linha JSON de metricas que o worker do broker consome.
+
+    Contrato de worker/agent.py::_parse_metrics: uma unica linha em stdout,
+    objeto JSON com a chave 'metrics' mapeando para um dict de numeros. Sem
+    ela o broker grava metrics_json vazio e os resultados so existem no Aim.
+    """
+    logs = getattr(model, "validation_logs", [])
+    if not logs:
+        return
+
+    # mesmos criterios do on_train_end do modelo, para a linha bater com o Aim
+    best_pearsonr = max(logs, key=lambda x: x["val_pearsonr"])
+    best_loss = min(logs, key=lambda x: x["val_loss"])
+    metrics = {
+        "best_val_pearsonr": float(best_pearsonr["val_pearsonr"]),
+        "best_val_loss": float(best_loss["val_loss"]),
+        "best_val_mae": float(best_loss["val_mae"]),
+        "epochs": trainer.current_epoch,
+    }
+    for name, value in trainer.callback_metrics.items():
+        if name.startswith("test_"):
+            metrics[name] = float(value)
+
+    print(json.dumps({"experiment": args.experiment, "seed": args.seed,
+                      "metrics": metrics}), flush=True)
 
 
 def configure_voxel_grid(args):
