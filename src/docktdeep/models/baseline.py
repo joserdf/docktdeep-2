@@ -93,6 +93,7 @@ class Baseline(pl.LightningModule):
         self.save_hyperparameters()
         self.loss_fn = torch.nn.MSELoss() # Try: L1Loss, SmoothL1Loss, HuberLoss
         self.mae = MeanAbsoluteError()
+        self.train_step_outputs = []
         self.validation_step_outputs = []
         self.test_step_outputs = []
         self.validation_logs = []
@@ -331,9 +332,8 @@ class Baseline(pl.LightningModule):
             self.log("train_semi", semi.detach(), **log_params)
         self.log(f"{stage}_loss", loss, **log_params)
 
-        if stage == "train":
-            pearsonr = torch.corrcoef(torch.stack((y_pred.squeeze(), y)))[0][1]
-            self.log("train_pearsonr", pearsonr, **log_params)
+        # as metricas de treino saem em on_train_epoch_end, sobre a epoca inteira:
+        # a media de correlacoes por batch de 64 pontos nao e o mesmo estimador
 
         out = {
             f"{stage}_loss": loss,
@@ -346,6 +346,11 @@ class Baseline(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         out = self.shared_step(batch, batch_idx, stage="train")
+        # detach obrigatorio: guardar o tensor com grafo manteria o backward da
+        # epoca inteira vivo na memoria
+        self.train_step_outputs.append(
+            {"preds": out["preds"].detach(), "labels": out["labels"].detach()}
+        )
         return out["train_loss"]
 
     def validation_step(self, batch, batch_idx):
@@ -357,6 +362,19 @@ class Baseline(pl.LightningModule):
         out = self.shared_step(batch, batch_idx, stage="test")
         self.test_step_outputs.append(out)
         return out["test_loss"]
+
+    def on_train_epoch_end(self) -> None:
+        out = self.train_step_outputs
+        if not out:
+            return
+        preds = torch.cat([x["preds"] for x in out]).squeeze()
+        labels = torch.cat([x["labels"] for x in out])
+
+        # train_loss ja e agregado pelo self.log do shared_step; repetir a chave
+        # aqui levantaria conflito de configuracao no Lightning
+        self.log_dict(self._regression_metrics(preds, labels, "train"), logger=True)
+
+        self.train_step_outputs.clear()
 
     def on_validation_epoch_end(self) -> None:
         out = self.validation_step_outputs
