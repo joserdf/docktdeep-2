@@ -393,7 +393,12 @@ class Baseline(pl.LightningModule):
         log["test_loss"] = torch.stack([x["test_loss"] for x in out]).mean()
         self.log_dict(log, prog_bar=True, logger=True)
 
-        self._dump_predictions(preds, labels)
+        # o dump nunca pode derrubar um treino que ja terminou: sem ele o run
+        # perde o CSV, com a excecao propagando perde tambem a linha de metricas
+        try:
+            self._dump_predictions(preds, labels)
+        except Exception as e:  # noqa: BLE001
+            print(f"[preds] falha ao gravar o CSV: {e}", flush=True)
 
         self.test_step_outputs.clear()
 
