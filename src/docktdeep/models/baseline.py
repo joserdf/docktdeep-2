@@ -1,6 +1,16 @@
+import csv
+import os
+
 import lightning.pytorch as pl
 import torch
 import torch.nn.functional as F
+from torchmetrics.functional.regression import (
+    mean_absolute_percentage_error,
+    mean_squared_error,
+    r2_score,
+    spearman_corrcoef,
+    symmetric_mean_absolute_percentage_error,
+)
 from torchmetrics.regression import MeanAbsoluteError
 
 __all__ = ["Baseline"]
@@ -224,6 +234,7 @@ class Baseline(pl.LightningModule):
         parser.add_argument("--emb-proj-dim", type=int, default=128, help="Dimension of embedding conditioning projections.")
         parser.add_argument("--semi", action="store_true", default=False, help="Enable factor C: semi-supervised + regularizers.")
         parser.add_argument("--no-cnn", action="store_true", default=False, help="Ablate the 3D CNN branch: predict from the frozen embeddings alone (requires --use-esm2 and/or --use-chemberta).")
+        parser.add_argument("--preds-dir", type=str, default="preds", help="Directory for the per-complex test predictions CSV (id,y_true,y_pred).")
         parser.add_argument("--loss", type=str, default="mse", choices=["mse", "huber"], help="Affinity regression loss.")
         parser.add_argument("--huber-beta", type=float, default=1.0, help="Huber loss beta (if --loss huber).")
         parser.add_argument("--label-smoothing", type=float, default=0.0, help="Shrink regression targets toward batch mean.")
@@ -352,11 +363,8 @@ class Baseline(pl.LightningModule):
         preds = torch.cat([x["preds"] for x in out]).squeeze()
         labels = torch.cat([x["labels"] for x in out])
 
-        pearsonr = torch.corrcoef(torch.stack((preds, labels)))[0][1]
-        loss = torch.stack([x["val_loss"] for x in out]).mean()
-        mae = self.mae(preds, labels)
-
-        log = {"val_pearsonr": pearsonr, "val_loss": loss, "val_mae": mae}
+        log = self._regression_metrics(preds, labels, "val")
+        log["val_loss"] = torch.stack([x["val_loss"] for x in out]).mean()
         self.log_dict(log, prog_bar=True, logger=True)
         self.validation_logs.append(log)
 
@@ -381,14 +389,65 @@ class Baseline(pl.LightningModule):
         preds = torch.cat([x["preds"] for x in out]).squeeze()
         labels = torch.cat([x["labels"] for x in out])
 
-        self.log_dict(
-            {
-                "test_pearsonr": torch.corrcoef(torch.stack((preds, labels)))[0][1],
-                "test_loss": torch.stack([x["test_loss"] for x in out]).mean(),
-                "test_mae": self.mae(preds, labels),
-            },
-            prog_bar=True,
-            logger=True,
-        )
+        log = self._regression_metrics(preds, labels, "test")
+        log["test_loss"] = torch.stack([x["test_loss"] for x in out]).mean()
+        self.log_dict(log, prog_bar=True, logger=True)
+
+        self._dump_predictions(preds, labels)
 
         self.test_step_outputs.clear()
+
+    def _regression_metrics(self, preds, labels, stage: str) -> dict:
+        """Metricas de regressao sobre o fold inteiro, para validacao e teste.
+
+        R2 nao e r²: `1 - SS_res/SS_tot` so coincide com o quadrado do Pearson sob
+        ajuste linear por minimos quadrados. Aqui os dois divergem, e a divergencia
+        e informativa (R2 pune vies de escala, r nao), entao os dois sao reportados.
+        """
+        mse = mean_squared_error(preds, labels)
+        return {
+            f"{stage}_pearsonr": torch.corrcoef(torch.stack((preds, labels)))[0][1],
+            f"{stage}_mae": self.mae(preds, labels),
+            f"{stage}_mse": mse,
+            f"{stage}_rmse": torch.sqrt(mse),
+            # MAPE/sMAPE dividem por |y|, que nao tem significado em pKi (grandeza
+            # intervalar); o epsilon do torchmetrics (1.17e-6) so evita o ZeroDivision.
+            f"{stage}_mape": mean_absolute_percentage_error(preds, labels),
+            f"{stage}_smape": symmetric_mean_absolute_percentage_error(preds, labels),
+            f"{stage}_r2": r2_score(preds, labels),
+            f"{stage}_spearman": spearman_corrcoef(preds, labels),
+        }
+
+    def _dump_predictions(self, preds, labels) -> None:
+        """Grava id,y_true,y_pred do fold de teste antes do descarte das saidas.
+
+        Sem os ids nao da para separar os estratos ood/casf, nem refazer analise
+        alguma sem re-treinar.
+        """
+        dataset = getattr(getattr(self, "trainer", None), "datamodule", None)
+        ids = getattr(getattr(dataset, "test_dataset", None), "ids", None)
+        if ids is None:
+            print("[preds] test_dataset sem ids: dump de predicoes ignorado", flush=True)
+            return
+        # unico anteparo contra um join silenciosamente errado
+        if len(ids) != preds.numel():
+            print(f"[preds] {len(ids)} ids para {preds.numel()} predicoes: dump ignorado "
+                  "para nao gravar um CSV desalinhado", flush=True)
+            return
+
+        preds_dir = self.hparams.get("preds_dir") or "preds"
+        experiment = self.hparams.get("experiment") or "unknown"
+        split_column = self.hparams.get("split_column") or "unknown"
+        seed = self.hparams.get("seed", 0)
+        os.makedirs(preds_dir, exist_ok=True)
+        path = os.path.join(preds_dir, f"{experiment}__{split_column}__seed{seed}.csv")
+
+        with open(path, "w", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["id", "y_true", "y_pred"])
+            writer.writerows(
+                zip(ids, labels.detach().cpu().tolist(), preds.detach().cpu().tolist())
+            )
+
+        # contrato de stdout com worker/agent.py::_parse_preds_path
+        print(f"[preds] {os.path.abspath(path)} ({len(ids)} linhas)", flush=True)

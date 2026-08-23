@@ -214,6 +214,7 @@ class PDBbind(pl.LightningDataModule):
             e_prot=e_prot,
             e_lig=e_lig,
             skip_voxel=self.no_cnn,
+            ids=sample_ids,
         )
 
         return data
@@ -315,6 +316,7 @@ class VoxelDataset(Dataset):
         e_prot: Optional[list] = None,
         e_lig: Optional[list] = None,
         skip_voxel: bool = False,
+        ids: Optional[list[str]] = None,
     ):
         assert len(protein_files) == len(ligand_files), "must have the same length!"
         assert len(protein_files) == len(labels), "must have the same length!"
@@ -322,6 +324,8 @@ class VoxelDataset(Dataset):
             assert len(e_prot) == len(labels), "e_prot must be aligned with labels!"
         if e_lig is not None:
             assert len(e_lig) == len(labels), "e_lig must be aligned with labels!"
+        if ids is not None:
+            assert len(ids) == len(labels), "ids must be aligned with labels!"
 
         self.ptn_files = protein_files
         self.lig_files = ligand_files
@@ -335,6 +339,7 @@ class VoxelDataset(Dataset):
         self.e_prot = e_prot
         self.e_lig = e_lig
         self.skip_voxel = skip_voxel
+        self.ids = ids
 
     def __len__(self) -> int:
         return len(self.labels)
