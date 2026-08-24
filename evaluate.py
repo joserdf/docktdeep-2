@@ -67,9 +67,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--dataframe-path", required=True)
-    ap.add_argument("--root-dir", required=True)
-    ap.add_argument("--embeddings-dir", required=True)
+    # vazio = usa o que o run gravou no checkpoint. As grades agrupadas treinaram
+    # com index-grouped-{cl1,nocl1}.csv e as demais com index-pfam.csv; deixar o
+    # ckpt decidir evita ter que reconstruir esse mapeamento na submissao.
+    ap.add_argument("--dataframe-path", default="")
+    ap.add_argument("--root-dir", default="")
+    ap.add_argument("--embeddings-dir", default="")
     ap.add_argument("--out-dir", default="", help="destino dos CSVs de predicao (vazio: nao grava)")
     ap.add_argument("--splits", default="validation,test")
     ap.add_argument("--batch-size", type=int, default=64)
@@ -81,16 +84,20 @@ def main() -> None:
     args = ap.parse_args()
 
     hp = dict(torch.load(args.ckpt, map_location="cpu", weights_only=False)["hyper_parameters"])
+    dataframe_path = args.dataframe_path or hp["dataframe_path"]
+    root_dir = args.root_dir or hp["root_dir"]
+    embeddings_dir = args.embeddings_dir or hp["embeddings_dir"]
+
     wanted = [s.strip() for s in args.splits.split(",") if s.strip()]
-    if "test" in wanted and not _has_test_split(hp, args.dataframe_path):
+    if "test" in wanted and not _has_test_split(hp, dataframe_path):
         wanted.remove("test")
 
     voxel_grid = configure_voxel_grid(_grid_args(hp, args.voxel_device))
 
     dm_args = dict(hp)
     dm_args.update(
-        dataframe_path=args.dataframe_path, root_dir=args.root_dir,
-        embeddings_dir=args.embeddings_dir, batch_size=args.batch_size,
+        dataframe_path=dataframe_path, root_dir=root_dir,
+        embeddings_dir=embeddings_dir, batch_size=args.batch_size,
         num_workers=args.num_workers,
         # o run original rodou com merge_val_test=True e por isso nunca tocou o
         # teste; aqui o held-out precisa existir como dataset proprio
@@ -111,6 +118,12 @@ def main() -> None:
            "use_esm2": hp.get("use_esm2"), "use_chemberta": hp.get("use_chemberta"),
            "semi": hp.get("semi"), "no_cnn": hp.get("no_cnn"), "metrics": {}}
 
+    # split_column identifica o fold da CV agrupada (grp_cv_o1..o5); sem ele os
+    # 4-5 folds de um mesmo experiment+seed gravariam o MESMO arquivo e so o
+    # ultimo sobreviveria. Mesmo esquema de Baseline._dump_predictions no treino,
+    # com o stage no fim porque aqui val e test saem do mesmo run.
+    preds_stem = f"{hp.get('experiment')}__{hp['split_column']}__seed{hp.get('seed')}"
+
     for split in wanted:
         dataset = dm.val_dataset if split == "validation" else dm.test_dataset
         loader = dm.val_dataloader() if split == "validation" else dm.test_dataloader()
@@ -124,7 +137,7 @@ def main() -> None:
 
         if args.out_dir:
             os.makedirs(args.out_dir, exist_ok=True)
-            name = f"{hp.get('experiment')}_s{hp.get('seed')}_{stage}.csv"
+            name = f"{preds_stem}__{stage}.csv"
             ids = getattr(dataset, "ids", None)
             if ids is not None and len(ids) == preds.numel():
                 with open(os.path.join(args.out_dir, name), "w", newline="") as fh:
