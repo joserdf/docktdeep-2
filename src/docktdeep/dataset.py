@@ -25,6 +25,7 @@ class PDBbind(pl.LightningDataModule):
         transforms=None,
         molecular_dropout: float = 0.0,
         molecular_dropout_unit: str = "",
+        molecular_dropout_embeddings: bool = False,
         root_dir: str = "",
         experiment: str = "",
         protein_path_pattern: str = "{c}_protein_prep.pdb.pkl",
@@ -47,6 +48,7 @@ class PDBbind(pl.LightningDataModule):
         self.transforms = transforms
         self.molecular_dropout = molecular_dropout
         self.molecular_dropout_unit = molecular_dropout_unit
+        self.molecular_dropout_embeddings = molecular_dropout_embeddings
         self.root_dir = root_dir
         self.experiment = experiment
         self.protein_path_pattern = protein_path_pattern
@@ -76,6 +78,7 @@ class PDBbind(pl.LightningDataModule):
         parser.add_argument("--rotation-90-degrees", action="store_true", default=False)
         parser.add_argument("--molecular-dropout", type=float, default=0.0)
         parser.add_argument("--molecular-dropout-unit", type=str, default="protein", help="protein, ligand, or complex")
+        parser.add_argument("--molecular-dropout-embeddings", action="store_true", default=False, help="Extend molecular dropout to the frozen embeddings: zero e_prot (ESM-2) when the protein is dropped and e_lig (ChemBERTa) when the ligand is dropped, so voxel and embedding agree on the same sample. Off by default: leaving it off reproduces runs made before this flag existed.")
         parser.add_argument("--protein-path-pattern", type=str, default="{c}_protein_prep.pdb.pkl", help="Path pattern for protein files, use {c} as placeholder for PDB ID")
         parser.add_argument("--ligand-path-pattern", type=str, default="{c}_ligand_rnum.pdb.pkl", help="Path pattern for ligand files, use {c} as placeholder for PDB ID")
         parser.add_argument("--split-column", type=str, default="random_split", help="Column name in the dataframe used to select train/validation/test splits")
@@ -211,6 +214,8 @@ class PDBbind(pl.LightningDataModule):
             voxel=voxel_grid,
             transform=self.transforms if split == "train" else None,
             molecular_dropout=self.molecular_dropout if split == "train" else 0.0,
+            molecular_dropout_unit=self.molecular_dropout_unit,
+            molecular_dropout_embeddings=self.molecular_dropout_embeddings,
             e_prot=e_prot,
             e_lig=e_lig,
             skip_voxel=self.no_cnn,
@@ -311,6 +316,8 @@ class VoxelDataset(Dataset):
         molparser: docktgrid.molparser.MolecularParser = docktgrid.molparser.MolecularParser(),
         transform: Optional[list[docktgrid.transforms.Transform]] = None,
         molecular_dropout: float = 0.0,
+        molecular_dropout_unit: str = "",
+        molecular_dropout_embeddings: bool = False,
         rng: np.random.Generator = np.random.default_rng(),
         root_dir: str = "",
         e_prot: Optional[list] = None,
@@ -335,6 +342,8 @@ class VoxelDataset(Dataset):
         self.root_dir = root_dir
         self.transform = transform
         self.molecular_dropout = molecular_dropout
+        self.molecular_dropout_unit = molecular_dropout_unit
+        self.molecular_dropout_embeddings = molecular_dropout_embeddings
         self.rng = rng
         self.e_prot = e_prot
         self.e_lig = e_lig
@@ -344,11 +353,26 @@ class VoxelDataset(Dataset):
     def __len__(self) -> int:
         return len(self.labels)
 
+    def _dropped_unit(self, beta: float) -> str:
+        """Qual entidade o molecular dropout tirou do voxel neste sorteio.
+
+        Espelha a decisao de MolecularDropout (transforms.py): com unit
+        'complex' o mesmo `beta` que as views recebem escolhe entre proteina e
+        ligante, com probabilidade 0.5 cada (`beta_probability`). Empate exato
+        em 0.5 segue get_protein_channels/get_ligand_channels ('ligand'); tem
+        probabilidade nula sob a uniforme.
+        """
+        if self.molecular_dropout_unit != "complex":
+            return self.molecular_dropout_unit
+        return "protein" if beta < 0.5 else "ligand"
+
     def __getitem__(self, idx):
         if self.skip_voxel:
             # ablacao --no-cnn: o modelo ignora `voxs`, entao nem o complexo nem o
             # grid sao construidos. Devolve um placeholder so para manter a forma
-            # da tupla que o _collate espera.
+            # da tupla que o _collate espera. O molecular dropout tambem nao roda
+            # aqui (nem o sorteio, nem o rotulo zerado), entao nao ha entidade
+            # descartada para mascarar no embedding.
             voxs = torch.zeros(1, dtype=torch.float32)
             return voxs, self.e_prot[idx] if self.e_prot is not None else None, \
                 self.e_lig[idx] if self.e_lig is not None else None, self.labels[idx]
@@ -364,6 +388,7 @@ class VoxelDataset(Dataset):
                 transform(molecule.coords, molecule.ligand_center)
 
         # apply molecular dropout
+        masked_unit = ""
         if self.molecular_dropout > 0.0:
             alpha, beta = self.rng.uniform(size=2)
             for v in self.voxel.views:
@@ -371,6 +396,8 @@ class VoxelDataset(Dataset):
 
             if alpha <= self.molecular_dropout:
                 label = torch.tensor(0.0, dtype=torch.float32)
+                if self.molecular_dropout_embeddings:
+                    masked_unit = self._dropped_unit(beta)
 
         voxs = self.voxel.voxelize(molecule)  # <- voxelization happens here
 
@@ -382,5 +409,10 @@ class VoxelDataset(Dataset):
         if self.e_prot is not None or self.e_lig is not None:
             e_prot = self.e_prot[idx] if self.e_prot is not None else None
             e_lig = self.e_lig[idx] if self.e_lig is not None else None
+            # copia zerada, nunca in-place: o vetor e do cache e reusado a cada epoca
+            if masked_unit == "protein" and e_prot is not None:
+                e_prot = np.zeros_like(e_prot)
+            if masked_unit == "ligand" and e_lig is not None:
+                e_lig = np.zeros_like(e_lig)
             return voxs, e_prot, e_lig, label
         return voxs, label

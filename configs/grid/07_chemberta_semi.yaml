@@ -40,6 +40,9 @@ train:
   wdecay: 0.0000169
   molecular_dropout: 0.06
   molecular_dropout_unit: complex
+  # off: mantem o comportamento das runs ja medidas (embedding do parceiro
+  # descartado continua intacto). on: zera e_prot/e_lig junto com o voxel.
+  molecular_dropout_embeddings: false
   depthwise_convs: true
   adaptive_pooling: true
   lambda_semi: 0.1
