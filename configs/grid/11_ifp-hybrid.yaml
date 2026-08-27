@@ -1,0 +1,59 @@
+# Arranjo 11 — ancora híbrida afinidade × IFP contínuo (N3, §10.2 do COMPARACAO)
+#
+# Fecha o desenho: combina afinidade e similaridade de interacao como peso
+# CONTINUO (sem o gate binario do N1). Ranqueia por afinidade E pondera pelo
+# quanto os modos de ligacao coincidem.
+#
+#   tgt_ij = exp(-|y_i - y_j| / yaware_sigma) * IFP_sim_ij
+#
+# Caso intermediario entre N1 (gate binario) e N2 (IFP puro): testa se a
+# versao continua e melhor ou pior que o gate do N1.
+arrangement: "11"
+name: ifp-hybrid
+factors:
+  esm2: off
+  chemberta: off
+  semi: on
+  anchor_mode: hybrid
+command_flags:
+  use_esm2: false
+  use_chemberta: false
+  semi: true
+  yaware: true
+  loss: huber
+  label_smoothing: 0.05
+  anchor_mode: hybrid
+  ifp_path: ../dataset/ifp.parquet
+
+model: Baseline
+
+data:
+  dataframe_path: data/pdbbind2020/index-pfam.csv
+  root_dir: data/pdbbind2020/processed
+  split_column: random_split
+  target_column: pki
+  merge_val_test: true
+  protein_path_pattern: "{c}_protein_prep.pdb.pkl"
+  ligand_path_pattern: "{c}_ligand_rnum.pdb.pkl"
+  batch_size: 64
+  num_workers: 8
+  vox_size: 1.0
+  box_dims: [24.0, 24.0, 24.0]
+  view: ["VolumeView", "BasicView"]
+  occupancy: gaussian
+  random_rotation: true
+
+train:
+  max_epochs: 1500
+  optimizer: AdamW
+  lr: 0.00087469
+  beta1: 0.25693012
+  eps: 0.00032933
+  dropout: 0.25348994
+  wdecay: 0.0000169
+  molecular_dropout: 0.06
+  molecular_dropout_unit: complex
+  molecular_dropout_embeddings: false
+  depthwise_convs: true
+  adaptive_pooling: true
+  lambda_semi: 0.1

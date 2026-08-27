@@ -1,0 +1,60 @@
+# Arranjo 12 — similaridade estrutural on-the-fly (10.5, §10.5 do COMPARACAO)
+#
+# Alternativa mais barata ao IFP: a alternativa §10.5 foi pensada ANTES do ODDT
+# estar instalado — ponderar a ancora de afinidade por uma similaridade
+# estrutural computada on-the-fly a partir do proprio voxel grid de entrada,
+# sem depender de IFP pre-computado. Nao ha gate: o peso e continuo.
+#
+#   tgt_ij = exp(-|y_i - y_j| / yaware_sigma) * voxel_sim_ij
+#
+# voxel_sim = cosseno de um descritor grosseiro (adaptive avg pool 4^3) do grid.
+# Testa se a ponderacao por estrutura on-the-fly (sem IFP) ja levanta a banda
+# forte OOD; se nao, o problema e a falta de condicao de contexto (reforca N1).
+arrangement: "12"
+name: struct-sim
+factors:
+  esm2: off
+  chemberta: off
+  semi: on
+  anchor_mode: struct
+command_flags:
+  use_esm2: false
+  use_chemberta: false
+  semi: true
+  yaware: true
+  loss: huber
+  label_smoothing: 0.05
+  anchor_mode: struct
+
+model: Baseline
+
+data:
+  dataframe_path: data/pdbbind2020/index-pfam.csv
+  root_dir: data/pdbbind2020/processed
+  split_column: random_split
+  target_column: pki
+  merge_val_test: true
+  protein_path_pattern: "{c}_protein_prep.pdb.pkl"
+  ligand_path_pattern: "{c}_ligand_rnum.pdb.pkl"
+  batch_size: 64
+  num_workers: 8
+  vox_size: 1.0
+  box_dims: [24.0, 24.0, 24.0]
+  view: ["VolumeView", "BasicView"]
+  occupancy: gaussian
+  random_rotation: true
+
+train:
+  max_epochs: 1500
+  optimizer: AdamW
+  lr: 0.00087469
+  beta1: 0.25693012
+  eps: 0.00032933
+  dropout: 0.25348994
+  wdecay: 0.0000169
+  molecular_dropout: 0.06
+  molecular_dropout_unit: complex
+  molecular_dropout_embeddings: false
+  depthwise_convs: true
+  adaptive_pooling: true
+  lambda_semi: 0.1

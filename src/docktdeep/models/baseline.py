@@ -202,8 +202,17 @@ class Baseline(pl.LightningModule):
         self.tau = float(self.hparams.get("semi_tau", 0.1))
         self.yaware = bool(self.hparams.get("yaware", False))
         self.yaware_sigma = float(self.hparams.get("yaware_sigma", 1.0))
-        self.ifp_aware = bool(self.hparams.get("ifp_aware", False))
         self.ifp_tau = float(self.hparams.get("ifp_tau", 0.3))
+        # Anchor of the y-aware InfoNCE: how the soft-positive target is built.
+        #   affinity  (arr05) tgt = exp(-|dy|/sigma)                    (pure yaware)
+        #   gate  (N1)         tgt = exp(-|dy|/sigma) * [IFP_sim >= tau] (running now)
+        #   ifp   (N2)         tgt = IFP_sim                             (pure IFP)
+        #   hybrid(N3)         tgt = exp(-|dy|/sigma) * IFP_sim          (continuous weight)
+        #   struct(10.5)       tgt = exp(-|dy|/sigma) * voxel_sim        (on-the-fly, no IFP)
+        anchor = str(self.hparams.get("anchor_mode", "affinity"))
+        if bool(self.hparams.get("ifp_aware", False)):
+            anchor = "gate"  # alias for backwards compat with the running N1 grid
+        self.anchor_mode = anchor
 
     def forward(self, x, e_prot=None, e_lig=None):
         f = self.forward_base_f(x, e_prot, e_lig)
@@ -246,8 +255,11 @@ class Baseline(pl.LightningModule):
         parser.add_argument("--semi-tau", type=float, default=0.1, help="Temperature for contrastive L_semi.")
         parser.add_argument("--yaware", action="store_true", default=False, help="Use y-aware InfoNCE (anchored on affinity) instead of embedding-anchored contrastive.")
         parser.add_argument("--yaware-sigma", type=float, default=1.0, help="Affinity distance scale (pKd) for y-aware positive weights.")
-        parser.add_argument("--ifp-aware", action="store_true", default=False, help="Gate the y-aware anchor by interaction fingerprint similarity: tgt_ij = exp(-|y_i-y_j|/sigma) * [IFP_sim_ij >= ifp_tau]. Requires --yaware and --ifp-path on the datamodule.")
+        parser.add_argument("--ifp-aware", action="store_true", default=False, help="Alias for --anchor-mode gate (backwards compat with arr09).")
         parser.add_argument("--ifp-tau", type=float, default=0.3, help="IFP Dice threshold for the IFP gate in the y-aware anchor.")
+        parser.add_argument("--anchor-mode", type=str, default="affinity",
+                            choices=["affinity", "gate", "ifp", "hybrid", "struct"],
+                            help="Anchor of the y-aware InfoNCE (requires --yaware). affinity: tgt=exp(-|dy|/s) (arr05). gate (N1): x [IFP_sim>=tau]. ifp (N2): tgt=IFP_sim. hybrid (N3): x IFP_sim (continuous). struct (10.5): x on-the-fly voxel similarity (no IFP needed).")
         # fmt: on
         return parent_parser
 
@@ -260,35 +272,73 @@ class Baseline(pl.LightningModule):
             weight_decay=self.hparams.wdecay,
         )
 
-    def _yaware_infonce(self, p, y, ifp=None):
-        """Soft InfoNCE anchored on the affinity labels themselves.
+    def _ifp_sim(self, ifp):
+        """Pairwise Dice similarity of binary interaction fingerprints (B, 4096) -> (B, B)."""
+        b = ifp.float()
+        inter = b @ b.T  # (B, B) shared bits
+        pop = b.sum(dim=1)  # (B,)
+        return 2.0 * inter / (pop[:, None] + pop[None, :] + 1e-8)
+
+    def _voxel_sim(self, x):
+        """On-the-fly structural similarity from the input voxel grids (10.5).
+
+        Coarse per-sample 3D-occupancy descriptor via adaptive average pooling to
+        (4,4,4); pairwise cosine similarity. Cheap and does not depend on the
+        precomputed IFP (the pre-IFP alternative of section 10.5).
+        """
+        B = x.shape[0]
+        desc = F.adaptive_avg_pool3d(x, (4, 4, 4))  # (B, C, 4, 4, 4)
+        desc = desc.reshape(B, -1)  # (B, C*64)
+        desc = F.normalize(desc, dim=1)
+        return desc @ desc.T  # (B, B)
+
+    def _yaware_infonce(self, p, y, ifp=None, x=None):
+        """Soft InfoNCE anchored on the affinity labels (and optionally structure).
 
         Samples with close pKd act as soft positives; far ones as negatives. This
         shapes p(f) so that projection-space proximity mirrors affinity ordering.
 
-        With ``--ifp-aware`` (and ``ifp`` given) the affinity anchor is gated by
-        interaction-fingerprint similarity: only pairs that share the same binding
-        mode (IFP Dice >= ifp_tau) are kept as positives.  Rows with no
-        IFP-positive partner contribute zero (no gradient), so the loss only shapes
-        ranking *within* the same interaction pattern.
+        ``self.anchor_mode`` controls how the soft-positive target is built:
+          affinity (arr05): tgt_ij = exp(-|y_i-y_j|/sigma)
+          gate (N1, --ifp-aware): affinity anchor gated by [IFP Dice >= ifp_tau]
+          ifp (N2): tgt_ij = IFP_sim_ij (pure interaction fingerprint)
+          hybrid (N3): affinity anchor weighted by continuous IFP_sim
+          struct (10.5): affinity anchor weighted by on-the-fly voxel similarity
+
+        Rows with no positive partner (sum ~ 0) contribute zero gradient, so the
+        loss only shapes ranking *within* the selected context.
         """
         B = p.shape[0]
         sim = p @ p.T / self.tau  # (B, B) embedding similarity
         d = torch.abs(y[:, None] - y[None, :])  # (B, B) affinity distance
-        tgt = torch.exp(-d / self.yaware_sigma) * (1.0 - torch.eye(B, device=p.device))
+        eye = torch.eye(B, device=p.device)
+        aff = torch.exp(-d / self.yaware_sigma) * (1.0 - eye)
+        needs_ifp = self.anchor_mode in ("gate", "ifp", "hybrid")
 
-        if self.ifp_aware and ifp is not None:
-            b = ifp.float()
-            inter = b @ b.T  # (B, B) shared bits (binary fingerprint)
-            pop = b.sum(dim=1)  # (B,)
-            ifp_sim = 2.0 * inter / (pop[:, None] + pop[None, :] + 1e-8)
-            gate = (ifp_sim >= self.ifp_tau).float() * (1.0 - torch.eye(B, device=p.device))
-            tgt = tgt * gate
-            rowsum = tgt.sum(dim=1, keepdim=True)
-            # zero-out (and keep at 0) rows with no IFP-positive partner
-            tgt = torch.where(rowsum > 1e-8, tgt / (rowsum + 1e-8), torch.zeros_like(tgt))
+        if needs_ifp and ifp is not None:
+            ifp_sim = self._ifp_sim(ifp) * (1.0 - eye)
+        if self.anchor_mode == "affinity" or (needs_ifp and ifp is None):
+            tgt = aff
+        elif self.anchor_mode == "gate":
+            gate = (self._ifp_sim(ifp) >= self.ifp_tau).float() * (1.0 - eye)
+            tgt = aff * gate
+        elif self.anchor_mode == "ifp":
+            tgt = ifp_sim
+        elif self.anchor_mode == "hybrid":
+            tgt = aff * ifp_sim
+        elif self.anchor_mode == "struct":
+            vsim = self._voxel_sim(x) * (1.0 - eye) if x is not None else None
+            tgt = aff * vsim if vsim is not None else aff
         else:
-            tgt = tgt / (tgt.sum(dim=1, keepdim=True) + 1e-8)  # normalize rows, self excluded
+            raise ValueError(f"unknown anchor_mode: {self.anchor_mode}")
+
+        # The target is a fixed weighting (labels / IFP / structure) — detach so
+        # gradient only flows through the projection similarity sim(p,p), never
+        # through the raw inputs (keeps the struct mode numerically stable).
+        tgt = tgt.detach()
+        # normalize rows; keep rows with no positive partner at 0 (no gradient)
+        rowsum = tgt.sum(dim=1, keepdim=True)
+        tgt = torch.where(rowsum > 1e-8, tgt / (rowsum + 1e-8), torch.zeros_like(tgt))
 
         log_softmax = torch.log_softmax(sim, dim=1)
         return -(tgt * log_softmax).sum(dim=1).mean()
@@ -301,7 +351,7 @@ class Baseline(pl.LightningModule):
         loss = F.mse_loss(p1, p2)  # consistency: align p(f) under two stochastic passes
 
         if self.yaware:
-            loss = loss + self._yaware_infonce(p1, y, ifp)
+            loss = loss + self._yaware_infonce(p1, y, ifp, x=x)
             return loss
 
         parts = []

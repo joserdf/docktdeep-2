@@ -1,0 +1,61 @@
+# Arranjo 10 — ancora IFP pura (N2, §10.2 do COMPARACAO)
+#
+# Controle do desenho N1: em vez de condicionar a ancora de afinidade, a ancora
+# E a propria similaridade de interaction fingerprint (PLEC, Dice). Agrupa por
+# modo de ligacao, ignorando a afinidade.
+#
+#   tgt_ij = IFP_sim_ij
+#
+# Predicao (da re-analise E): deve ser neutro a levemente pior — a colocacao
+# entre familias ja esta saturada e o N2 nao mexe no ranking intra-familia.
+# Separa "ranqueia por afinidade dentro do mesmo bolsao" (N1) de
+# "agrupa por bolsao" (N2).
+arrangement: "10"
+name: ifp-pure
+factors:
+  esm2: off
+  chemberta: off
+  semi: on
+  anchor_mode: ifp
+command_flags:
+  use_esm2: false
+  use_chemberta: false
+  semi: true
+  yaware: true
+  loss: huber
+  label_smoothing: 0.05
+  anchor_mode: ifp
+  ifp_path: ../dataset/ifp.parquet
+
+model: Baseline
+
+data:
+  dataframe_path: data/pdbbind2020/index-pfam.csv
+  root_dir: data/pdbbind2020/processed
+  split_column: random_split
+  target_column: pki
+  merge_val_test: true
+  protein_path_pattern: "{c}_protein_prep.pdb.pkl"
+  ligand_path_pattern: "{c}_ligand_rnum.pdb.pkl"
+  batch_size: 64
+  num_workers: 8
+  vox_size: 1.0
+  box_dims: [24.0, 24.0, 24.0]
+  view: ["VolumeView", "BasicView"]
+  occupancy: gaussian
+  random_rotation: true
+
+train:
+  max_epochs: 1500
+  optimizer: AdamW
+  lr: 0.00087469
+  beta1: 0.25693012
+  eps: 0.00032933
+  dropout: 0.25348994
+  wdecay: 0.0000169
+  molecular_dropout: 0.06
+  molecular_dropout_unit: complex
+  molecular_dropout_embeddings: false
+  depthwise_convs: true
+  adaptive_pooling: true
+  lambda_semi: 0.1
