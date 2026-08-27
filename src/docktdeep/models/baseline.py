@@ -202,6 +202,8 @@ class Baseline(pl.LightningModule):
         self.tau = float(self.hparams.get("semi_tau", 0.1))
         self.yaware = bool(self.hparams.get("yaware", False))
         self.yaware_sigma = float(self.hparams.get("yaware_sigma", 1.0))
+        self.ifp_aware = bool(self.hparams.get("ifp_aware", False))
+        self.ifp_tau = float(self.hparams.get("ifp_tau", 0.3))
 
     def forward(self, x, e_prot=None, e_lig=None):
         f = self.forward_base_f(x, e_prot, e_lig)
@@ -244,6 +246,8 @@ class Baseline(pl.LightningModule):
         parser.add_argument("--semi-tau", type=float, default=0.1, help="Temperature for contrastive L_semi.")
         parser.add_argument("--yaware", action="store_true", default=False, help="Use y-aware InfoNCE (anchored on affinity) instead of embedding-anchored contrastive.")
         parser.add_argument("--yaware-sigma", type=float, default=1.0, help="Affinity distance scale (pKd) for y-aware positive weights.")
+        parser.add_argument("--ifp-aware", action="store_true", default=False, help="Gate the y-aware anchor by interaction fingerprint similarity: tgt_ij = exp(-|y_i-y_j|/sigma) * [IFP_sim_ij >= ifp_tau]. Requires --yaware and --ifp-path on the datamodule.")
+        parser.add_argument("--ifp-tau", type=float, default=0.3, help="IFP Dice threshold for the IFP gate in the y-aware anchor.")
         # fmt: on
         return parent_parser
 
@@ -256,21 +260,40 @@ class Baseline(pl.LightningModule):
             weight_decay=self.hparams.wdecay,
         )
 
-    def _yaware_infonce(self, p, y):
+    def _yaware_infonce(self, p, y, ifp=None):
         """Soft InfoNCE anchored on the affinity labels themselves.
 
         Samples with close pKd act as soft positives; far ones as negatives. This
         shapes p(f) so that projection-space proximity mirrors affinity ordering.
+
+        With ``--ifp-aware`` (and ``ifp`` given) the affinity anchor is gated by
+        interaction-fingerprint similarity: only pairs that share the same binding
+        mode (IFP Dice >= ifp_tau) are kept as positives.  Rows with no
+        IFP-positive partner contribute zero (no gradient), so the loss only shapes
+        ranking *within* the same interaction pattern.
         """
         B = p.shape[0]
         sim = p @ p.T / self.tau  # (B, B) embedding similarity
         d = torch.abs(y[:, None] - y[None, :])  # (B, B) affinity distance
         tgt = torch.exp(-d / self.yaware_sigma) * (1.0 - torch.eye(B, device=p.device))
-        tgt = tgt / (tgt.sum(dim=1, keepdim=True) + 1e-8)  # normalize rows, self excluded
+
+        if self.ifp_aware and ifp is not None:
+            b = ifp.float()
+            inter = b @ b.T  # (B, B) shared bits (binary fingerprint)
+            pop = b.sum(dim=1)  # (B,)
+            ifp_sim = 2.0 * inter / (pop[:, None] + pop[None, :] + 1e-8)
+            gate = (ifp_sim >= self.ifp_tau).float() * (1.0 - torch.eye(B, device=p.device))
+            tgt = tgt * gate
+            rowsum = tgt.sum(dim=1, keepdim=True)
+            # zero-out (and keep at 0) rows with no IFP-positive partner
+            tgt = torch.where(rowsum > 1e-8, tgt / (rowsum + 1e-8), torch.zeros_like(tgt))
+        else:
+            tgt = tgt / (tgt.sum(dim=1, keepdim=True) + 1e-8)  # normalize rows, self excluded
+
         log_softmax = torch.log_softmax(sim, dim=1)
         return -(tgt * log_softmax).sum(dim=1).mean()
 
-    def _semi_loss(self, x, e_prot, e_lig, y):
+    def _semi_loss(self, x, e_prot, e_lig, y, ifp=None):
         """L_semi (factor C): consistency (R-Drop) + contrastive (y-aware or embedding-anchored)."""
         self.train()  # enable dropout for stochastic passes
         p1 = F.normalize(self.proj_head(self.forward_base_f(x, e_prot, e_lig)), dim=1)
@@ -278,7 +301,7 @@ class Baseline(pl.LightningModule):
         loss = F.mse_loss(p1, p2)  # consistency: align p(f) under two stochastic passes
 
         if self.yaware:
-            loss = loss + self._yaware_infonce(p1, y)
+            loss = loss + self._yaware_infonce(p1, y, ifp)
             return loss
 
         parts = []
@@ -308,11 +331,14 @@ class Baseline(pl.LightningModule):
         return f
 
     def shared_step(self, batch, batch_idx, stage):
-        if len(batch) == 4:
+        if len(batch) == 5:
+            x, e_prot, e_lig, ifp, y = batch
+        elif len(batch) == 4:
             x, e_prot, e_lig, y = batch
+            ifp = None
         else:
             x, y = batch
-            e_prot = e_lig = None
+            e_prot = e_lig = ifp = None
         y_pred = self(x, e_prot, e_lig)
 
         log_params = {
@@ -327,7 +353,7 @@ class Baseline(pl.LightningModule):
             y_target = y_target * (1.0 - self.label_smoothing) + y_target.mean() * self.label_smoothing
         loss = self.loss_fn(y_pred, y_target)
         if self.proj_head is not None and stage == "train":
-            semi = self._semi_loss(x, e_prot, e_lig, y)
+            semi = self._semi_loss(x, e_prot, e_lig, y, ifp)
             loss = loss + self.lambda_semi * semi
             self.log("train_semi", semi.detach(), **log_params)
         self.log(f"{stage}_loss", loss, **log_params)

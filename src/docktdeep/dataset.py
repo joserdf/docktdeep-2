@@ -39,6 +39,7 @@ class PDBbind(pl.LightningDataModule):
         embeddings_dir: str = "data/embeddings",
         esm2_model: str = "esm2-650M",
         no_cnn: bool = False,
+        ifp_path: str = "",  # optional PLEC IFP parquet (id + ifp_<0..4095>); feeds the IFP-aware yaware
         **kwargs,
     ):
         super().__init__()
@@ -62,6 +63,8 @@ class PDBbind(pl.LightningDataModule):
         self.embeddings_dir = embeddings_dir
         self.esm2_model = esm2_model
         self.no_cnn = no_cnn
+        self.ifp_path = ifp_path
+        self._ifp_dict = None  # lazily-loaded {id: uint8[4096]} when ifp_path set
 
     @staticmethod
     def add_specific_args(parent_parser):
@@ -88,6 +91,7 @@ class PDBbind(pl.LightningDataModule):
         parser.add_argument("--use-chemberta", action="store_true", default=False, help="Condition on frozen ChemBERTa ligand embeddings (factor B).")
         parser.add_argument("--embeddings-dir", type=str, default="data/embeddings", help="Dir with cached embeddings and mapping jsons.")
         parser.add_argument("--esm2-model", type=str, default="esm2-650M", help="ESM-2 model key used for cached protein embeddings.")
+        parser.add_argument("--ifp-path", type=str, default="", help="Path to PLEC IFP parquet (columns id + ifp_0..ifp_4095). When set, each sample carries its binary 4096-bit interaction fingerprint in the batch for the IFP-aware yaware loss (--ifp-aware).")
         # fmt: on
 
         return parent_parser
@@ -207,6 +211,17 @@ class PDBbind(pl.LightningDataModule):
             ]
             voxel_grid.views = views
 
+        # optional per-sample interaction fingerprint for the IFP-aware yaware loss
+        ifps = None
+        if self.ifp_path:
+            if self._ifp_dict is None:
+                df = pd.read_parquet(self.ifp_path)
+                self._ifp_dict = {
+                    str(cid): vec.astype(np.uint8)
+                    for cid, vec in zip(df["id"].astype(str), df.drop(columns=["id"]).to_numpy(np.uint8))
+                }
+            ifps = [self._ifp_dict.get(sid) for sid in sample_ids]
+
         data = VoxelDataset(
             protein_files=protein_mols,
             ligand_files=ligand_mols,
@@ -218,6 +233,7 @@ class PDBbind(pl.LightningDataModule):
             molecular_dropout_embeddings=self.molecular_dropout_embeddings,
             e_prot=e_prot,
             e_lig=e_lig,
+            ifp=ifps,
             skip_voxel=self.no_cnn,
             ids=sample_ids,
         )
@@ -258,11 +274,38 @@ class PDBbind(pl.LightningDataModule):
 
     @staticmethod
     def _collate(batch):
-        """Collate samples that may carry embeddings (4-tuple) or not (2-tuple).
+        """Collate samples that may carry embeddings (4-tuple), IFP (5-tuple) or neither (2-tuple).
 
         Embedding positions that are all None collapse back to None; mixed
         None/array positions are zero-padded (should not happen after filtering).
+        The IFP position (5-tuple) is always a dense (B, 4096) uint8 tensor.
         """
+        if len(batch[0]) == 5:
+            voxs = torch.stack([b[0] for b in batch])
+            y = torch.stack([b[4] for b in batch])
+
+            def maybe_stack(lst):
+                if any(v is not None for v in lst):
+                    ref = lst[0]
+                    return torch.stack(
+                        [torch.as_tensor(v) if v is not None else torch.zeros_like(torch.as_tensor(ref))
+                         for v in lst]
+                    )
+                return None
+
+            # a missing IFP (not in the parquet) is zero-padded: an all-zero
+            # fingerprint has Dice 0 with every other sample, so it is gated out
+            # of the IFP-aware loss and contributes no gradient.
+            ref = next((b[3] for b in batch if b[3] is not None), None)
+            ifps = [torch.as_tensor(b[3], dtype=torch.uint8) if b[3] is not None
+                    else torch.zeros(1 if ref is None else len(ref), dtype=torch.uint8)
+                    for b in batch]
+
+            return (voxs,
+                    maybe_stack([b[1] for b in batch]),
+                    maybe_stack([b[2] for b in batch]),
+                    torch.stack(ifps),
+                    y)
         if len(batch[0]) == 4:
             voxs = torch.stack([b[0] for b in batch])
             y = torch.stack([b[3] for b in batch])
@@ -322,6 +365,7 @@ class VoxelDataset(Dataset):
         root_dir: str = "",
         e_prot: Optional[list] = None,
         e_lig: Optional[list] = None,
+        ifp: Optional[list] = None,
         skip_voxel: bool = False,
         ids: Optional[list[str]] = None,
     ):
@@ -331,6 +375,8 @@ class VoxelDataset(Dataset):
             assert len(e_prot) == len(labels), "e_prot must be aligned with labels!"
         if e_lig is not None:
             assert len(e_lig) == len(labels), "e_lig must be aligned with labels!"
+        if ifp is not None:
+            assert len(ifp) == len(labels), "ifp must be aligned with labels!"
         if ids is not None:
             assert len(ids) == len(labels), "ids must be aligned with labels!"
 
@@ -347,6 +393,7 @@ class VoxelDataset(Dataset):
         self.rng = rng
         self.e_prot = e_prot
         self.e_lig = e_lig
+        self.ifp = ifp
         self.skip_voxel = skip_voxel
         self.ids = ids
 
@@ -374,8 +421,11 @@ class VoxelDataset(Dataset):
             # aqui (nem o sorteio, nem o rotulo zerado), entao nao ha entidade
             # descartada para mascarar no embedding.
             voxs = torch.zeros(1, dtype=torch.float32)
-            return voxs, self.e_prot[idx] if self.e_prot is not None else None, \
-                self.e_lig[idx] if self.e_lig is not None else None, self.labels[idx]
+            e_prot = self.e_prot[idx] if self.e_prot is not None else None
+            e_lig = self.e_lig[idx] if self.e_lig is not None else None
+            if self.ifp is not None:
+                return voxs, e_prot, e_lig, self.ifp[idx], self.labels[idx]
+            return voxs, e_prot, e_lig, self.labels[idx]
 
         molecule = docktgrid.molecule.MolecularComplex(
             self.ptn_files[idx], self.lig_files[idx], self.molparser, self.root_dir
@@ -406,7 +456,7 @@ class VoxelDataset(Dataset):
             if isinstance(transform, Random90DegreesRotation):
                 voxs = transform(voxs)
 
-        if self.e_prot is not None or self.e_lig is not None:
+        if self.e_prot is not None or self.e_lig is not None or self.ifp is not None:
             e_prot = self.e_prot[idx] if self.e_prot is not None else None
             e_lig = self.e_lig[idx] if self.e_lig is not None else None
             # copia zerada, nunca in-place: o vetor e do cache e reusado a cada epoca
@@ -414,5 +464,7 @@ class VoxelDataset(Dataset):
                 e_prot = np.zeros_like(e_prot)
             if masked_unit == "ligand" and e_lig is not None:
                 e_lig = np.zeros_like(e_lig)
+            if self.ifp is not None:
+                return voxs, e_prot, e_lig, self.ifp[idx], label
             return voxs, e_prot, e_lig, label
         return voxs, label

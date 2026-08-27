@@ -1,0 +1,66 @@
+# Arranjo 09 — fator C + regularizador IFP-condicionado (N1, §10 do COMPARACAO)
+#
+# Variante do yaware (fator C) em que a ancora de afinidade e restrita a pares
+# que compartilham o MESMO modo de ligacao: a similaridade de interaction
+# fingerprint (PLEC, Dice) do par tem que passar do limiar `ifp_tau`.
+#
+#   tgt_ij = exp(-|y_i - y_j| / yaware_sigma) * [IFP_sim_ij >= ifp_tau]
+#
+# Linhas sem nenhum parceiro IFP-positivo contribuem zero (nao forcam o p(f) a
+# nada): a loss so da forma ao ranking DENTRO do mesmo padrao de interacao.
+#
+# Requer o IFP/PLEC computado (ver ga-036-analysis/src/grid/compute_ifp.py e
+# out/metrics/ifp.parquet) e o caminho em --ifp-path.  Nao faz parte da grade
+# 2^3 original (fatores A/B/C); e um novo arranjo proposto.
+arrangement: "09"
+name: ifp-aware
+factors:
+  esm2: off
+  chemberta: off
+  semi: on
+  ifp_aware: on
+command_flags:
+  use_esm2: false
+  use_chemberta: false
+  semi: true
+  yaware: true
+  loss: huber
+  label_smoothing: 0.05
+  ifp_aware: true
+  ifp_tau: 0.3
+  # caminho relativo aonde o train.py roda (maquina do broker); copiar
+  # ga-036-analysis/out/metrics/ifp.parquet para la. Veja broker/tools/submit_ifp.py.
+  ifp_path: ../dataset/ifp.parquet
+
+model: Baseline
+
+data:
+  dataframe_path: data/pdbbind2020/index-pfam.csv
+  root_dir: data/pdbbind2020/processed
+  split_column: random_split
+  target_column: pki   # rotulo em unidades de pK; delta_g = -1.364*pK
+  merge_val_test: true
+  protein_path_pattern: "{c}_protein_prep.pdb.pkl"
+  ligand_path_pattern: "{c}_ligand_rnum.pdb.pkl"
+  batch_size: 64
+  num_workers: 8
+  vox_size: 1.0
+  box_dims: [24.0, 24.0, 24.0]
+  view: ["VolumeView", "BasicView"]
+  occupancy: gaussian
+  random_rotation: true
+
+train:
+  max_epochs: 1500
+  optimizer: AdamW
+  lr: 0.00087469
+  beta1: 0.25693012
+  eps: 0.00032933
+  dropout: 0.25348994
+  wdecay: 0.0000169
+  molecular_dropout: 0.06
+  molecular_dropout_unit: complex
+  molecular_dropout_embeddings: false
+  depthwise_convs: true
+  adaptive_pooling: true
+  lambda_semi: 0.1
