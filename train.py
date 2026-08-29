@@ -58,18 +58,57 @@ def run(args):
     model = eval(args.model)(input_size=voxel_grid.shape, **vars(args))
     data_module = PDBbind(voxel_grid=voxel_grid, transforms=transforms, **vars(args))
 
-    trainer.fit(model, datamodule=data_module)
+    # ckpt_path: resume de task pausada pelo broker (checkpoint enviado pelo
+    # worker anterior). Sem o argumento, comportamento identico ao original.
+    trainer.fit(model, datamodule=data_module, ckpt_path=args.ckpt_path)
+
+    ckpt_cb = next(c for c in trainer.callbacks if isinstance(c, ModelCheckpoint))
+    for tag, path in (("last", ckpt_cb.last_model_path), ("best", ckpt_cb.best_model_path)):
+        if path:
+            # Contrato do worker do broker (agent.py::_parse_ckpt_path): a pausa
+            # localiza os checkpoints por essas linhas de stdout.
+            print(f"[ckpt] {tag}={path}", flush=True)
 
     # Report on the held-out fold with the checkpoint that ModelCheckpoint
     # selected on the (cluster-disjoint) validation slice. Skipped under
     # --merge-val-test, where the datamodule aliases validation to test and
     # testing would only re-report the selection metric.
+    # Em resume, o "best" do 2o half pode ser pior que o best pre-pause
+    # (--prior-best-path): testa o vencedor global, selecionado pelo val_pearsonr.
+    prior_score = None
+    if args.prior_best_path and os.path.exists(args.prior_best_path):
+        prior_score = _load_best_score(args.prior_best_path)
+        if prior_score is not None:
+            model._prior_best_pearsonr = prior_score
     if not args.merge_val_test:
-        trainer.test(model, datamodule=data_module, ckpt_path="best")
+        winner = "best"
+        if prior_score is not None and (ckpt_cb.best_model_score is None
+                                        or prior_score > ckpt_cb.best_model_score):
+            winner = args.prior_best_path
+            print(f"[ckpt] winner=prior-best (val_pearsonr={prior_score:.4f})", flush=True)
+        trainer.test(model, datamodule=data_module, ckpt_path=winner)
 
     emit_metrics_line(trainer, model, args)
 
     return trainer
+
+
+def _load_best_score(ckpt_path: str):
+    """val_pearsonr do melhor checkpoint lido do estado do ModelCheckpoint
+    gravado no arquivo (ckpt['callbacks']). None se nao for possivel ler.
+
+    Em Lightning >= 2.x, ckpt['callbacks'] e um dict {repr(callback): state};
+    em versoes antigas, uma lista de states. Os dois formatos sao aceitos."""
+    try:
+        cbs = torch.load(ckpt_path, map_location="cpu",
+                         weights_only=False).get("callbacks")
+        states = list(cbs.values()) if isinstance(cbs, dict) else (cbs or [])
+        for cb_state in states:
+            if isinstance(cb_state, dict) and cb_state.get("best_model_score") is not None:
+                return float(cb_state["best_model_score"])
+    except Exception:
+        return None
+    return None
 
 
 def emit_metrics_line(trainer, model, args) -> None:
@@ -86,8 +125,15 @@ def emit_metrics_line(trainer, model, args) -> None:
     # mesmos criterios do on_train_end do modelo, para a linha bater com o Aim
     best_pearsonr = max(logs, key=lambda x: x["val_pearsonr"])
     best_loss = min(logs, key=lambda x: x["val_loss"])
+    # resume: o melhor val_pearsonr pode ter sido alcancado no 1o half (pre-pause);
+    # model._prior_best_pearsonr e preenchido em run() quando --prior-best-path existe
+    prior = getattr(model, "_prior_best_pearsonr", None)
+    if prior is not None:
+        best_pearsonr_val = max(float(best_pearsonr["val_pearsonr"]), prior)
+    else:
+        best_pearsonr_val = float(best_pearsonr["val_pearsonr"])
     metrics = {
-        "best_val_pearsonr": float(best_pearsonr["val_pearsonr"]),
+        "best_val_pearsonr": best_pearsonr_val,
         "best_val_loss": float(best_loss["val_loss"]),
         "best_val_mae": float(best_loss["val_mae"]),
         "epochs": trainer.current_epoch,
@@ -143,7 +189,9 @@ def configure_callbacks():
     patience = 1000
     callbacks = [
         # EarlyStopping(monitor=monitor, mode=mode, patience=patience),
-        ModelCheckpoint(monitor=monitor, mode=mode, save_top_k=1),
+        # save_last: essencial p/ o pause/migracao do broker — sem ele so o
+        # "best" e guardado e o resume voltaria ate o melhor epoch (nao ao ultimo).
+        ModelCheckpoint(monitor=monitor, mode=mode, save_top_k=1, save_last=True),
     ]
     return callbacks
 
@@ -186,6 +234,12 @@ def get_parser():
     trainer_parser.add_argument("--detect-anomaly", action="store_true", default=False)
     trainer_parser.add_argument("--gradient-clip-val", type=float, default=5.0)
     trainer_parser.add_argument("--gradient-clip-algorithm", type=str, default="norm")
+    # resume (broker pause/migracao): o worker injeta esses argumentos quando
+    # claima uma task pausada com checkpoint
+    trainer_parser.add_argument("--ckpt-path", type=str, default=None,
+                                help="retomar o fit deste checkpoint (caminho absoluto)")
+    trainer_parser.add_argument("--prior-best-path", type=str, default=None,
+                                help="best checkpoint do 1o half (pre-pause), p/ testar o vencedor global")
 
     # data args
     parser.add_argument(
