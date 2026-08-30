@@ -49,11 +49,18 @@ def _has_test_split(hp: dict, dataframe_path: str) -> bool:
 def _run_split(model, loader, device: str):
     preds, labels = [], []
     for batch in loader:
-        if len(batch) == 4:
+        if len(batch) == 5:
+            # treino com --ifp-path: o collate devolve (voxs, e_prot, e_lig, ifps, y).
+            # O IFP so condiciona a loss de treino; na inferencia e ignorado.
+            x, e_prot, e_lig, _ifp, y = batch
+            x = x.to(device) if x is not None and torch.is_tensor(x) else x
+            e_prot = e_prot.to(device) if e_prot is not None and torch.is_tensor(e_prot) else e_prot
+            e_lig = e_lig.to(device) if e_lig is not None and torch.is_tensor(e_lig) else e_lig
+        elif len(batch) == 4:
             x, e_prot, e_lig, y = batch
             x = x.to(device) if x is not None and torch.is_tensor(x) else x
-            e_prot = e_prot.to(device) if torch.is_tensor(e_prot) else e_prot
-            e_lig = e_lig.to(device) if torch.is_tensor(e_lig) else e_lig
+            e_prot = e_prot.to(device) if e_prot is not None and torch.is_tensor(e_prot) else e_prot
+            e_lig = e_lig.to(device) if e_lig is not None and torch.is_tensor(e_lig) else e_lig
         else:
             x, y = batch
             e_prot = e_lig = None
