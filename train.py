@@ -33,7 +33,7 @@ def run(args):
 
     pl.seed_everything(args.seed)
 
-    callbacks = configure_callbacks()
+    callbacks = configure_callbacks(args.early_stop_patience)
     logger = configure_logger(args)
     track_files(logger)
 
@@ -184,15 +184,22 @@ def configure_logger(args):
     return logger
 
 
-def configure_callbacks():
+def configure_callbacks(early_stop_patience: int = 0):
     monitor, mode = "val_pearsonr", "max"
-    patience = 1000
     callbacks = [
-        # EarlyStopping(monitor=monitor, mode=mode, patience=patience),
         # save_last: essencial p/ o pause/migracao do broker — sem ele so o
         # "best" e guardado e o resume voltaria ate o melhor epoch (nao ao ultimo).
         ModelCheckpoint(monitor=monitor, mode=mode, save_top_k=1, save_last=True),
     ]
+    if early_stop_patience > 0:
+        # Early stopping para cortar o rabo sobre-treinado: o checkpoint final
+        # (e199) generaliza PIOR OOD que o best-val (0.02-0.06, consistente em
+        # 58 runs IFP — RESULTS-MEASURED §21). Parar `early_stop_patience` epochs
+        # apos o ultimo pico de val preserva o best-val (o ModelCheckpoint ja o
+        # guarda) e economiza o resto do orcamento. 0 = desligado (orcamento
+        # fixo, o protocolo das campanhas anteriores).
+        callbacks.append(EarlyStopping(monitor=monitor, mode=mode,
+                                       patience=early_stop_patience))
     return callbacks
 
 
@@ -234,6 +241,9 @@ def get_parser():
     trainer_parser.add_argument("--detect-anomaly", action="store_true", default=False)
     trainer_parser.add_argument("--gradient-clip-val", type=float, default=5.0)
     trainer_parser.add_argument("--gradient-clip-algorithm", type=str, default="norm")
+    trainer_parser.add_argument("--early-stop-patience", type=int, default=50,
+                                help="parar apos N epochs sem melhorar val_pearsonr "
+                                     "(0 = desligado; default 50 — RESULTS-MEASURED §21)")
     # resume (broker pause/migracao): o worker injeta esses argumentos quando
     # claima uma task pausada com checkpoint
     trainer_parser.add_argument("--ckpt-path", type=str, default=None,
