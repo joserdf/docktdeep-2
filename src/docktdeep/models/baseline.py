@@ -1,6 +1,7 @@
 import csv
 import os
 
+import numpy as np
 import lightning.pytorch as pl
 import torch
 import torch.nn.functional as F
@@ -16,7 +17,14 @@ from torchmetrics.regression import MeanAbsoluteError
 __all__ = ["Baseline"]
 
 # ESM-2 model key -> embedding dim (matches tools/precompute_esm2.py).
-ESM2_DIMS = {"esm2-650M": 1280, "esm2-150M": 640, "esm2-35M": 480, "esm2-8M": 320}
+ESM2_DIMS = {
+    "esm2-650M": 1280,
+    "esm2-3B": 2560,
+    "esm2-15B": 5120,
+    "esm2-150M": 640,
+    "esm2-35M": 480,
+    "esm2-8M": 320,
+}
 E_LIG_DIM = 768  # ChemBERTa (zinc-base)
 
 
@@ -213,8 +221,68 @@ class Baseline(pl.LightningModule):
         if bool(self.hparams.get("ifp_aware", False)):
             anchor = "gate"  # alias for backwards compat with the running N1 grid
         self.anchor_mode = anchor
+        self.lambda_aff = float(self.hparams.get("lambda_aff", 1.0))
+        self.lambda_ifp = float(self.hparams.get("lambda_ifp", 1.0))
+        self.lambda_prot = float(self.hparams.get("lambda_prot", 0.0))
+        self.lambda_lig = float(self.hparams.get("lambda_lig", 0.0))
+        self.auto_scale_loss = bool(self.hparams.get("auto_scale_loss", True))
+
+        # factor C decomposition: independent similarity terms (ifp/aff/prot/lig).
+        # When --sim-terms is non-empty this path replaces the single y-aware
+        # InfoNCE; the matrices are COMMON attributes (not register_buffer) so
+        # ~370 MB never enter a .ckpt, and row indices come from the datamodule.
+        self.sim_terms = list(self.hparams.get("sim_terms", []))
+        self.sim_lambda = float(self.hparams.get("sim_lambda", 0.025))
+        self.sim_lambda_max = float(self.hparams.get("sim_lambda_max", 0.125))
+        self.sim_kendall = bool(self.hparams.get("sim_kendall", False))
+        self.sim_mat_dir = str(self.hparams.get("sim_mat_dir", ""))
+        self.S_prot = None
+        self.S_lig = None
+        if self.sim_terms:
+            if self.sim_kendall:
+                raise NotImplementedError(
+                    "--sim-kendall is the phase-4.3 fallback (learned Kendall uncertainty "
+                    "weighting) and is not implemented yet; run the plain ablation first.")
+            if self.yaware:
+                raise ValueError("--sim-terms is incompatible with --yaware: the decomposed "
+                                 "similarity terms replace the y-aware InfoNCE.")
+            if bool(self.hparams.get("ifp_aware", False)):
+                raise ValueError("--sim-terms is incompatible with --ifp-aware "
+                                 "(alias that forces --anchor-mode gate).")
+            if self.anchor_mode != "affinity":
+                raise ValueError(
+                    f"--sim-terms is incompatible with --anchor-mode '{self.anchor_mode}': "
+                    "keep the default 'affinity' (the anchor is unused in the decomposed path).")
+            if "ifp" in self.sim_terms and not self.hparams.get("ifp_path"):
+                raise ValueError(
+                    "--sim-terms ifp requires --ifp-path: without it every ifp slot is None and "
+                    "L_ifp would be identically zero (a dead term) while the run looks healthy.")
+            # non-dominance budget: lambda_semi (RDrop) + one lambda per term must
+            # stay within the total block (D5: 5 x 0.025 = 0.125).
+            total = self.lambda_semi + len(self.sim_terms) * self.sim_lambda
+            if total > self.sim_lambda_max + 1e-9:
+                raise ValueError(
+                    f"similarity budget {total:.3f} (lambda_semi + |K|*sim_lambda) exceeds "
+                    f"--sim-lambda-max {self.sim_lambda_max}; lower --sim-lambda or --lambda-semi.")
+            self._load_sim_matrices()
+
+    def _load_sim_matrices(self):
+        """Load the precomputed similarity matrices as plain numpy arrays.
+
+        Kept as common attributes (NOT register_buffer) so the ~370 MB never end
+        up in a .ckpt. Only the (B, B) sub-block needed per batch is moved to the
+        device (see _prot_target/_lig_target), never the whole matrix.
+        """
+        if "prot" in self.sim_terms:
+            self.S_prot = np.load(os.path.join(self.sim_mat_dir, "S_prot.npz"))["S"]
+        if "lig" in self.sim_terms:
+            self.S_lig = np.load(os.path.join(self.sim_mat_dir, "S_lig.npz"))["S"]
 
     def forward(self, x, e_prot=None, e_lig=None):
+        if e_prot is not None and isinstance(e_prot, torch.Tensor) and e_prot.device != self.device:
+            e_prot = e_prot.to(self.device)
+        if e_lig is not None and isinstance(e_lig, torch.Tensor) and e_lig.device != self.device:
+            e_lig = e_lig.to(self.device)
         f = self.forward_base_f(x, e_prot, e_lig)
         if not self.no_cnn:  # sem CNN o `f` ja e a concatenacao das projecoes
             if self.proj_prot is not None and e_prot is not None:
@@ -258,8 +326,25 @@ class Baseline(pl.LightningModule):
         parser.add_argument("--ifp-aware", action="store_true", default=False, help="Alias for --anchor-mode gate (backwards compat with arr09).")
         parser.add_argument("--ifp-tau", type=float, default=0.3, help="IFP Dice threshold for the IFP gate in the y-aware anchor.")
         parser.add_argument("--anchor-mode", type=str, default="affinity",
-                            choices=["affinity", "gate", "ifp", "hybrid", "struct"],
-                            help="Anchor of the y-aware InfoNCE (requires --yaware). affinity: tgt=exp(-|dy|/s) (arr05). gate (N1): x [IFP_sim>=tau]. ifp (N2): tgt=IFP_sim. hybrid (N3): x IFP_sim (continuous). struct (10.5): x on-the-fly voxel similarity (no IFP needed).")
+                            choices=["affinity", "gate", "ifp", "hybrid", "struct", "dual"],
+                            help="Anchor of the y-aware InfoNCE (requires --yaware). affinity: tgt=exp(-|dy|/s) (arr05). gate (N1): x [IFP_sim>=tau]. ifp (N2): tgt=IFP_sim. hybrid (N3): x IFP_sim (continuous). struct (10.5): x on-the-fly voxel similarity. dual: separate L_aff and L_ifp terms with scale balancing.")
+        parser.add_argument("--lambda-aff", type=float, default=1.0, help="Weight of affinity contrastive term in dual mode.")
+        parser.add_argument("--lambda-ifp", type=float, default=1.0, help="Weight of IFP contrastive term in dual mode.")
+        parser.add_argument("--lambda-prot", type=float, default=0.0, help="Weight of ESM-2 protein embedding cosine contrastive term.")
+        parser.add_argument("--lambda-lig", type=float, default=0.0, help="Weight of ChemBERTa ligand embedding cosine contrastive term.")
+        parser.add_argument("--auto-scale-loss", action="store_true", default=True, help="Equalize magnitudes of loss terms via scale balancing before applying weights.")
+        parser.add_argument("--eval-test-per-epoch", action="store_true", default=False, help="Evaluate test set and log test_pearsonr, test_pearsonr_ood, test_pearsonr_casf at each epoch end.")
+        parser.add_argument("--sim-terms", nargs="+", default=[],
+                            choices=["ifp", "aff", "prot", "lig"],
+                            help="Factor C decomposition: independent similarity terms, each an InfoNCE over the same projection p(f). Replaces the y-aware InfoNCE. Mutually exclusive with --yaware/--ifp-aware/non-default --anchor-mode.")
+        parser.add_argument("--sim-lambda", type=float, default=0.025,
+                            help="Weight of each active similarity term (lambda_0 in the proposal).")
+        parser.add_argument("--sim-lambda-max", type=float, default=0.125,
+                            help="Budget cap for the whole similarity block = lambda_semi + |K|*sim_lambda (D5: 5 x 0.025). With the default --lambda-semi 1.0 the budget always trips; set --lambda-semi 0.025 alongside --sim-terms.")
+        parser.add_argument("--sim-mat-dir", type=str, default="",
+                            help="Dir with S_prot.npz / S_lig.npz (loaded as common attributes, not buffers).")
+        parser.add_argument("--sim-kendall", action="store_true", default=False,
+                            help="Use learned Kendall uncertainty weighting (phase-4.3 fallback). NOT implemented yet.")
         # fmt: on
         return parent_parser
 
@@ -292,66 +377,175 @@ class Baseline(pl.LightningModule):
         desc = F.normalize(desc, dim=1)
         return desc @ desc.T  # (B, B)
 
-    def _yaware_infonce(self, p, y, ifp=None, x=None):
-        """Soft InfoNCE anchored on the affinity labels (and optionally structure).
+    def _sim_infonce(self, p, tgt):
+        """InfoNCE against a fixed soft target (factor C decomposition).
 
-        Samples with close pKd act as soft positives; far ones as negatives. This
-        shapes p(f) so that projection-space proximity mirrors affinity ordering.
-
-        ``self.anchor_mode`` controls how the soft-positive target is built:
-          affinity (arr05): tgt_ij = exp(-|y_i-y_j|/sigma)
-          gate (N1, --ifp-aware): affinity anchor gated by [IFP Dice >= ifp_tau]
-          ifp (N2): tgt_ij = IFP_sim_ij (pure interaction fingerprint)
-          hybrid (N3): affinity anchor weighted by continuous IFP_sim
-          struct (10.5): affinity anchor weighted by on-the-fly voxel similarity
-
-        Rows with no positive partner (sum ~ 0) contribute zero gradient, so the
-        loss only shapes ranking *within* the selected context.
+        ``tgt`` is row-normalized; rows with no positive partner (rowsum ~ 0)
+        stay at zero and contribute no gradient, so the loss only shapes ranking
+        *within* each sample's selected context.
         """
-        B = p.shape[0]
         sim = p @ p.T / self.tau  # (B, B) embedding similarity
-        d = torch.abs(y[:, None] - y[None, :])  # (B, B) affinity distance
-        eye = torch.eye(B, device=p.device)
-        aff = torch.exp(-d / self.yaware_sigma) * (1.0 - eye)
-        needs_ifp = self.anchor_mode in ("gate", "ifp", "hybrid")
-
-        if needs_ifp and ifp is not None:
-            ifp_sim = self._ifp_sim(ifp) * (1.0 - eye)
-        if self.anchor_mode == "affinity" or (needs_ifp and ifp is None):
-            tgt = aff
-        elif self.anchor_mode == "gate":
-            gate = (self._ifp_sim(ifp) >= self.ifp_tau).float() * (1.0 - eye)
-            tgt = aff * gate
-        elif self.anchor_mode == "ifp":
-            tgt = ifp_sim
-        elif self.anchor_mode == "hybrid":
-            tgt = aff * ifp_sim
-        elif self.anchor_mode == "struct":
-            vsim = self._voxel_sim(x) * (1.0 - eye) if x is not None else None
-            tgt = aff * vsim if vsim is not None else aff
-        else:
-            raise ValueError(f"unknown anchor_mode: {self.anchor_mode}")
-
-        # The target is a fixed weighting (labels / IFP / structure) — detach so
+        # The target is a fixed weighting (labels / IFP / similarity) — detach so
         # gradient only flows through the projection similarity sim(p,p), never
-        # through the raw inputs (keeps the struct mode numerically stable).
+        # through the raw inputs.
         tgt = tgt.detach()
-        # normalize rows; keep rows with no positive partner at 0 (no gradient)
         rowsum = tgt.sum(dim=1, keepdim=True)
         tgt = torch.where(rowsum > 1e-8, tgt / (rowsum + 1e-8), torch.zeros_like(tgt))
-
         log_softmax = torch.log_softmax(sim, dim=1)
         return -(tgt * log_softmax).sum(dim=1).mean()
 
-    def _semi_loss(self, x, e_prot, e_lig, y, ifp=None):
-        """L_semi (factor C): consistency (R-Drop) + contrastive (y-aware or embedding-anchored)."""
+    def _yaware_infonce(self, p, y, ifp=None, x=None, e_prot=None, e_lig=None, reg_loss=None):
+        """Soft InfoNCE anchored on affinity, IFP, structure, or embedding similarities.
+
+        Shapes p(f) so that projection-space proximity mirrors target similarity ordering.
+        """
+        B = p.shape[0]
+        eye = torch.eye(B, device=p.device)
+        d = torch.abs(y[:, None] - y[None, :])  # (B, B) affinity distance
+        aff = torch.exp(-d / self.yaware_sigma) * (1.0 - eye)
+        needs_ifp = self.anchor_mode in ("gate", "ifp", "hybrid", "dual")
+
+        if needs_ifp and ifp is not None:
+            ifp_sim = self._ifp_sim(ifp) * (1.0 - eye)
+        if self.anchor_mode == "dual" and ifp is not None:
+            l_aff = self._sim_infonce(p, aff)
+            l_ifp = self._sim_infonce(p, ifp_sim)
+            if self.auto_scale_loss and reg_loss is not None:
+                reg_scale = reg_loss.detach() + 1e-8
+                l_aff_s = l_aff * (reg_scale / (l_aff.detach() + 1e-8))
+                l_ifp_s = l_ifp * (reg_scale / (l_ifp.detach() + 1e-8))
+            elif self.auto_scale_loss:
+                l_aff_s = l_aff / (l_aff.detach() + 1e-8)
+                l_ifp_s = l_ifp / (l_ifp.detach() + 1e-8)
+            else:
+                l_aff_s, l_ifp_s = l_aff, l_ifp
+            base_loss = self.lambda_aff * l_aff_s + self.lambda_ifp * l_ifp_s
+        elif self.anchor_mode == "affinity" or (needs_ifp and ifp is None):
+            tgt = aff
+            base_loss = self._sim_infonce(p, tgt)
+        elif self.anchor_mode == "gate":
+            gate = (self._ifp_sim(ifp) >= self.ifp_tau).float() * (1.0 - eye)
+            tgt = aff * gate
+            base_loss = self._sim_infonce(p, tgt)
+        elif self.anchor_mode == "ifp":
+            tgt = ifp_sim
+            base_loss = self._sim_infonce(p, tgt)
+        elif self.anchor_mode == "hybrid":
+            tgt = aff * ifp_sim
+            base_loss = self._sim_infonce(p, tgt)
+        elif self.anchor_mode == "struct":
+            vsim = self._voxel_sim(x) * (1.0 - eye) if x is not None else None
+            tgt = aff * vsim if vsim is not None else aff
+            base_loss = self._sim_infonce(p, tgt)
+        else:
+            raise ValueError(f"unknown anchor_mode: {self.anchor_mode}")
+
+        total_loss = base_loss
+
+        # Optional ESM-2 protein embedding cosine similarity term
+        if self.lambda_prot > 0.0 and e_prot is not None:
+            e_prot_norm = F.normalize(e_prot, dim=1)
+            tgt_prot = torch.relu(e_prot_norm @ e_prot_norm.T) * (1.0 - eye)
+            l_prot = self._sim_infonce(p, tgt_prot)
+            if self.auto_scale_loss and reg_loss is not None:
+                reg_scale = reg_loss.detach() + 1e-8
+                l_prot_s = l_prot * (reg_scale / (l_prot.detach() + 1e-8))
+            elif self.auto_scale_loss:
+                l_prot_s = l_prot / (l_prot.detach() + 1e-8)
+            else:
+                l_prot_s = l_prot
+            total_loss = total_loss + self.lambda_prot * l_prot_s
+
+        # Optional ChemBERTa ligand embedding cosine similarity term
+        if self.lambda_lig > 0.0 and e_lig is not None:
+            e_lig_norm = F.normalize(e_lig, dim=1)
+            tgt_lig = torch.relu(e_lig_norm @ e_lig_norm.T) * (1.0 - eye)
+            l_lig = self._sim_infonce(p, tgt_lig)
+            if self.auto_scale_loss and reg_loss is not None:
+                reg_scale = reg_loss.detach() + 1e-8
+                l_lig_s = l_lig * (reg_scale / (l_lig.detach() + 1e-8))
+            elif self.auto_scale_loss:
+                l_lig_s = l_lig / (l_lig.detach() + 1e-8)
+            else:
+                l_lig_s = l_lig
+            total_loss = total_loss + self.lambda_lig * l_lig_s
+
+        return total_loss
+
+    # --- target builders for the similarity-term decomposition (factor C) ----
+    def _aff_target(self, y):
+        """Soft-positive target from affinity proximity: exp(-|dy| / sigma), off-diagonal."""
+        B = y.shape[0]
+        d = torch.abs(y[:, None] - y[None, :])
+        return torch.exp(-d / self.yaware_sigma) * (1.0 - torch.eye(B, device=y.device))
+
+    def _ifp_target(self, ifp):
+        """Soft-positive target from PLEC IFP Dice, off-diagonal."""
+        B = ifp.shape[0]
+        return self._ifp_sim(ifp) * (1.0 - torch.eye(B, device=ifp.device))
+
+    def _prot_target(self, prot_idx):
+        """Soft-positive target from precomputed PSI (S_prot), off-diagonal.
+
+        Only the (B, B) sub-block is gathered on CPU and moved to the device; the
+        full matrix stays a numpy array. Values are PSI/100 in [0, 1]; the all-zero
+        sentinel row yields a zero target row (no gradient).
+        """
+        pidx = prot_idx.detach().cpu().numpy()
+        sub = self.S_prot[np.ix_(pidx, pidx)].astype(np.float32) / 100.0
+        tgt = torch.as_tensor(sub, device=prot_idx.device)
+        return tgt * (1.0 - torch.eye(pidx.shape[0], device=prot_idx.device))
+
+    def _lig_target(self, lig_idx):
+        """Soft-positive target from precomputed Morgan Tanimoto (S_lig), off-diagonal."""
+        lidx = lig_idx.detach().cpu().numpy()
+        sub = self.S_lig[np.ix_(lidx, lidx)].astype(np.float32) / 100.0
+        tgt = torch.as_tensor(sub, device=lig_idx.device)
+        return tgt * (1.0 - torch.eye(lidx.shape[0], device=lig_idx.device))
+
+    def _sim_terms_loss(self, p, prot_idx, lig_idx, ifp, y):
+        """Weighted sum of the active similarity terms over the shared projection p.
+
+        Returns ``(weighted_total, per_term)`` where ``per_term[k] = (L_k, row_frac)``
+        with ``L_k`` the unweighted loss and ``row_frac`` the fraction of batch rows
+        that have at least one positive partner for that term.
+        """
+        total = torch.zeros((), device=p.device)
+        per_term = {}
+        for k in self.sim_terms:
+            if k == "ifp":
+                tgt = self._ifp_target(ifp)
+            elif k == "aff":
+                tgt = self._aff_target(y)
+            elif k == "prot":
+                tgt = self._prot_target(prot_idx)
+            elif k == "lig":
+                tgt = self._lig_target(lig_idx)
+            else:
+                raise ValueError(f"unknown sim term: {k}")
+            row_frac = (tgt.sum(dim=1) > 1e-8).float().mean()
+            Lk = self._sim_infonce(p, tgt)
+            per_term[k] = (Lk, row_frac)
+            total = total + Lk
+        return self.sim_lambda * total, per_term
+
+    def _semi_loss(self, x, e_prot, e_lig, y, ifp=None, prot_idx=None, lig_idx=None, reg_loss=None):
+        """L_semi (factor C): consistency (R-Drop) + contrastive (y-aware or embedding-anchored).
+
+        With --sim-terms active it returns ``(rdrop, sim_block)``; otherwise a
+        scalar ``rdrop [+ contrastive]`` (legacy paths untouched).
+        """
         self.train()  # enable dropout for stochastic passes
         p1 = F.normalize(self.proj_head(self.forward_base_f(x, e_prot, e_lig)), dim=1)
         p2 = F.normalize(self.proj_head(self.forward_base_f(x, e_prot, e_lig)), dim=1)
-        loss = F.mse_loss(p1, p2)  # consistency: align p(f) under two stochastic passes
+        rdrop = F.mse_loss(p1, p2)  # consistency: align p(f) under two stochastic passes
 
+        if self.sim_terms:
+            return rdrop, self._sim_terms_loss(p1, prot_idx, lig_idx, ifp, y)
+
+        loss = rdrop
         if self.yaware:
-            loss = loss + self._yaware_infonce(p1, y, ifp, x=x)
+            loss = loss + self._yaware_infonce(p1, y, ifp, x=x, e_prot=e_prot, e_lig=e_lig, reg_loss=reg_loss)
             return loss
 
         parts = []
@@ -368,6 +562,10 @@ class Baseline(pl.LightningModule):
 
     def forward_base_f(self, x, e_prot=None, e_lig=None):
         """Forward up to the base latent f (before embedding conditioning)."""
+        if e_prot is not None and isinstance(e_prot, torch.Tensor) and e_prot.device != self.device:
+            e_prot = e_prot.to(self.device)
+        if e_lig is not None and isinstance(e_lig, torch.Tensor) and e_lig.device != self.device:
+            e_lig = e_lig.to(self.device)
         if self.no_cnn:
             parts = []
             if self.proj_prot is not None and e_prot is not None:
@@ -381,14 +579,22 @@ class Baseline(pl.LightningModule):
         return f
 
     def shared_step(self, batch, batch_idx, stage):
-        if len(batch) == 5:
+        if len(batch) == 7:
+            # similarity-term ablation: (voxs, e_prot, e_lig, ifp, prot_idx, lig_idx, y)
+            x, e_prot, e_lig, ifp, prot_idx, lig_idx, y = batch
+        elif len(batch) == 5:
             x, e_prot, e_lig, ifp, y = batch
+            prot_idx = lig_idx = None
         elif len(batch) == 4:
             x, e_prot, e_lig, y = batch
-            ifp = None
+            ifp = prot_idx = lig_idx = None
         else:
             x, y = batch
-            e_prot = e_lig = ifp = None
+            e_prot = e_lig = ifp = prot_idx = lig_idx = None
+        if e_prot is not None and isinstance(e_prot, torch.Tensor) and e_prot.device != self.device:
+            e_prot = e_prot.to(self.device)
+        if e_lig is not None and isinstance(e_lig, torch.Tensor) and e_lig.device != self.device:
+            e_lig = e_lig.to(self.device)
         y_pred = self(x, e_prot, e_lig)
 
         log_params = {
@@ -403,9 +609,18 @@ class Baseline(pl.LightningModule):
             y_target = y_target * (1.0 - self.label_smoothing) + y_target.mean() * self.label_smoothing
         loss = self.loss_fn(y_pred, y_target)
         if self.proj_head is not None and stage == "train":
-            semi = self._semi_loss(x, e_prot, e_lig, y, ifp)
-            loss = loss + self.lambda_semi * semi
-            self.log("train_semi", semi.detach(), **log_params)
+            if self.sim_terms:
+                rdrop, (sim_block, per_term) = self._semi_loss(
+                    x, e_prot, e_lig, y, ifp, prot_idx, lig_idx, reg_loss=loss)
+                loss = loss + self.lambda_semi * rdrop + sim_block
+                self.log("train_semi", rdrop.detach(), **log_params)
+                for k, (Lk, row_frac) in per_term.items():
+                    self.log(f"train_sim_{k}", Lk.detach(), **log_params)
+                    self.log(f"train_sim_{k}_rows", row_frac.detach(), **log_params)
+            else:
+                semi = self._semi_loss(x, e_prot, e_lig, y, ifp, reg_loss=loss)
+                loss = loss + self.lambda_semi * semi
+                self.log("train_semi", semi.detach(), **log_params)
         self.log(f"{stage}_loss", loss, **log_params)
 
         # as metricas de treino saem em on_train_epoch_end, sobre a epoca inteira:
@@ -459,6 +674,51 @@ class Baseline(pl.LightningModule):
 
         log = self._regression_metrics(preds, labels, "val")
         log["val_loss"] = torch.stack([x["val_loss"] for x in out]).mean()
+
+        dm = getattr(self.trainer, "datamodule", None)
+        if dm is not None and getattr(dm, "val_strata", None) is not None:
+            val_strata = np.array(dm.val_strata)
+            if len(val_strata) == preds.numel():
+                for st in np.unique(val_strata):
+                    mask = (val_strata == st)
+                    if mask.sum() >= 2:
+                        sub_p = preds[mask]
+                        sub_l = labels[mask]
+                        sub_m = self._regression_metrics(sub_p, sub_l, f"val_{st}")
+                        log.update(sub_m)
+
+        if bool(self.hparams.get("eval_test_per_epoch", False)) and dm is not None and hasattr(dm, "test_dataloader"):
+            was_training = self.training
+            self.eval()
+            test_loader = dm.test_dataloader()
+            t_preds, t_labels = [], []
+            with torch.no_grad():
+                for batch in test_loader:
+                    # loop manual: o Lightning so move o batch p/ a GPU nos
+                    # *_step que ele mesmo chama, entao aqui e por nossa conta
+                    batch = self.transfer_batch_to_device(batch, self.device, 0)
+                    out = self.shared_step(batch, 0, stage="test")
+                    t_preds.append(out["preds"].detach().cpu())
+                    t_labels.append(out["labels"].detach().cpu())
+            if t_preds:
+                t_preds = torch.cat(t_preds).squeeze()
+                t_labels = torch.cat(t_labels)
+                t_metrics = self._regression_metrics(t_preds, t_labels, "test")
+                log.update(t_metrics)
+                if getattr(dm, "test_strata", None) is not None:
+                    test_strata = np.array(dm.test_strata)
+                    if len(test_strata) == t_preds.numel():
+                        for st in np.unique(test_strata):
+                            mask = (test_strata == st)
+                            if mask.sum() >= 2:
+                                sub_p = t_preds[mask]
+                                sub_l = t_labels[mask]
+                                sub_m = self._regression_metrics(sub_p, sub_l, f"test_{st}")
+                                log.update(sub_m)
+            # sem isto o modelo seguiria em eval() no resto do treino (dropout
+            # e batchnorm desligados) — fatal numa busca que tuna dropout
+            self.train(was_training)
+
         self.log_dict(log, prog_bar=True, logger=True)
         self.validation_logs.append(log)
 

@@ -31,6 +31,7 @@ class PDBbind(pl.LightningDataModule):
         protein_path_pattern: str = "{c}_protein_prep.pdb.pkl",
         ligand_path_pattern: str = "{c}_ligand_rnum.pdb.pkl",
         split_column: str = "random_split",  # Column name in the dataframe used to select train/validation/test splits
+        stratum_column: str = "",
         target_column: str = "pki",  # Regression label: pK (pKd/pKi/pIC50). See configs/grid/README.md.
         merge_val_test: bool = False,
         num_workers: int = 4,
@@ -40,6 +41,10 @@ class PDBbind(pl.LightningDataModule):
         esm2_model: str = "esm2-650M",
         no_cnn: bool = False,
         ifp_path: str = "",  # optional PLEC IFP parquet (id + ifp_<0..4095>); feeds the IFP-aware yaware
+        sim_terms: list = [],  # similarity terms active (ifp/aff/prot/lig); triggers the canonical 7-tuple
+        sim_mat_dir: str = "",  # dir with S_prot.npz / S_lig.npz (read only for the sentinel row index)
+        sim_prot_map: str = "",  # json {complex_id: row} for S_prot
+        sim_lig_map: str = "",  # json {complex_id: row} for S_lig
         **kwargs,
     ):
         super().__init__()
@@ -55,6 +60,7 @@ class PDBbind(pl.LightningDataModule):
         self.protein_path_pattern = protein_path_pattern
         self.ligand_path_pattern = ligand_path_pattern
         self.split_column = split_column
+        self.stratum_column = stratum_column
         self.target_column = target_column
         self.merge_val_test = merge_val_test
         self.num_workers = num_workers
@@ -65,6 +71,11 @@ class PDBbind(pl.LightningDataModule):
         self.no_cnn = no_cnn
         self.ifp_path = ifp_path
         self._ifp_dict = None  # lazily-loaded {id: uint8[4096]} when ifp_path set
+        self.sim_terms = list(sim_terms)
+        self.sim_mat_dir = sim_mat_dir
+        self.sim_prot_map = sim_prot_map
+        self.sim_lig_map = sim_lig_map
+        self._sim_maps = None  # (prot_map, lig_map) + sentinel rows, loaded lazily when sim_terms set
 
     @staticmethod
     def add_specific_args(parent_parser):
@@ -85,6 +96,7 @@ class PDBbind(pl.LightningDataModule):
         parser.add_argument("--protein-path-pattern", type=str, default="{c}_protein_prep.pdb.pkl", help="Path pattern for protein files, use {c} as placeholder for PDB ID")
         parser.add_argument("--ligand-path-pattern", type=str, default="{c}_ligand_rnum.pdb.pkl", help="Path pattern for ligand files, use {c} as placeholder for PDB ID")
         parser.add_argument("--split-column", type=str, default="random_split", help="Column name in the dataframe used to select train/validation/test splits")
+        parser.add_argument("--stratum-column", type=str, default="", help="Column name in the dataframe used for stratum logging during validation")
         parser.add_argument("--target-column", type=str, default="pki", help="Regression label column: 'pki' (pK units, default) or 'delta_g' (kcal/mol). delta_g = -RT*ln(10)*pK, so they differ only by a factor of -1.364.")
         parser.add_argument("--merge-val-test", action="store_true", default=False, help="Whether to merge validation and test sets for evaluation")
         parser.add_argument("--use-esm2", action="store_true", default=False, help="Condition on frozen ESM-2 protein embeddings (factor A).")
@@ -92,6 +104,11 @@ class PDBbind(pl.LightningDataModule):
         parser.add_argument("--embeddings-dir", type=str, default="data/embeddings", help="Dir with cached embeddings and mapping jsons.")
         parser.add_argument("--esm2-model", type=str, default="esm2-650M", help="ESM-2 model key used for cached protein embeddings.")
         parser.add_argument("--ifp-path", type=str, default="", help="Path to PLEC IFP parquet (columns id + ifp_0..ifp_4095). When set, each sample carries its binary 4096-bit interaction fingerprint in the batch for the IFP-aware yaware loss (--ifp-aware).")
+        # --sim-mat-dir is registered by the MODEL (Baseline.add_specific_args); the
+        # datamodule only consumes its value (sentinel index) via vars(args). Same for
+        # --sim-terms. Only the two map paths are dataset-owned flags.
+        parser.add_argument("--sim-prot-map", type=str, default="", help="Path to prot_map.json: {complex_id: row index into S_prot}. Used to build per-sample prot_idx for the similarity-term ablation (--sim-terms).")
+        parser.add_argument("--sim-lig-map", type=str, default="", help="Path to lig_map.json: {complex_id: row index into S_lig}. Used to build per-sample lig_idx for the similarity-term ablation (--sim-terms).")
         # fmt: on
 
         return parent_parser
@@ -201,6 +218,27 @@ class PDBbind(pl.LightningDataModule):
             e_lig = [e_lig[i] for i in idx] if e_lig is not None else None
             print(f"  ({split}) removidos por embedding ausente: {len(keep) - len(idx)}")
 
+        if split == "validation":
+            stratum_col = self.stratum_column
+            if not stratum_col:
+                if self.split_column.startswith("grp_mixval_o"):
+                    stratum_col = self.split_column.replace("grp_mixval_o", "grp_mixval_stratum_o")
+                elif "grp_stratum" in self.df.columns:
+                    stratum_col = "grp_stratum"
+            if stratum_col and stratum_col in self.df.columns:
+                st_map = self.df.set_index("id")[stratum_col].to_dict()
+                self.val_strata = [str(st_map.get(sid, "unknown")) for sid in sample_ids]
+            else:
+                self.val_strata = None
+
+        if split == "test":
+            stratum_col = "grp_stratum" if "grp_stratum" in self.df.columns else self.stratum_column
+            if stratum_col and stratum_col in self.df.columns:
+                st_map = self.df.set_index("id")[stratum_col].to_dict()
+                self.test_strata = [str(st_map.get(sid, "unknown")) for sid in sample_ids]
+            else:
+                self.test_strata = None
+
         # apply molecular dropout view
         voxel_grid = self.voxel_grid
         if self.molecular_dropout > 0.0 and split == "train":
@@ -222,6 +260,18 @@ class PDBbind(pl.LightningDataModule):
                 }
             ifps = [self._ifp_dict.get(sid) for sid in sample_ids]
 
+        # per-sample row indices into the precomputed similarity matrices for the
+        # similarity-term ablation (factor C). A complex absent from a map points
+        # to the shared all-zero sentinel row (zero-gradient, IFP convention).
+        prot_idx = None
+        lig_idx = None
+        if self.sim_terms:
+            if self._sim_maps is None:
+                self._load_sim_maps()
+            prot_map, lig_map = self._sim_maps
+            prot_idx = [prot_map.get(sid, self._prot_sentinel) for sid in sample_ids]
+            lig_idx = [lig_map.get(sid, self._lig_sentinel) for sid in sample_ids]
+
         data = VoxelDataset(
             protein_files=protein_mols,
             ligand_files=ligand_mols,
@@ -236,6 +286,9 @@ class PDBbind(pl.LightningDataModule):
             ifp=ifps,
             skip_voxel=self.no_cnn,
             ids=sample_ids,
+            prot_idx=prot_idx,
+            lig_idx=lig_idx,
+            sim_terms=self.sim_terms,
         )
 
         return data
@@ -272,6 +325,25 @@ class PDBbind(pl.LightningDataModule):
             ]
         return e_prot, e_lig
 
+    def _load_sim_maps(self):
+        """Load {complex_id: row} maps + the sentinel row index from the npz.
+
+        The sentinel is stored in the precomputed matrices (precompute_sim.py),
+        NOT in the json maps: a complex absent from a map (e.g. no SMILES in the
+        split) must point to the all-zero sentinel row so it contributes zero
+        gradient. np.load on a .npz is lazy, so reading only ``["sentinel"]``
+        decompresses just the tiny scalar.
+        """
+        import numpy as np
+
+        with open(self.sim_prot_map) as fh:
+            self._prot_map = {str(k): int(v) for k, v in json.load(fh).items()}
+        with open(self.sim_lig_map) as fh:
+            self._lig_map = {str(k): int(v) for k, v in json.load(fh).items()}
+        self._prot_sentinel = int(np.load(os.path.join(self.sim_mat_dir, "S_prot.npz"))["sentinel"])
+        self._lig_sentinel = int(np.load(os.path.join(self.sim_mat_dir, "S_lig.npz"))["sentinel"])
+        self._sim_maps = (self._prot_map, self._lig_map)
+
     @staticmethod
     def _collate(batch):
         """Collate samples that may carry embeddings (4-tuple), IFP (5-tuple) or neither (2-tuple).
@@ -279,14 +351,46 @@ class PDBbind(pl.LightningDataModule):
         Embedding positions that are all None collapse back to None; mixed
         None/array positions are zero-padded (should not happen after filtering).
         The IFP position (5-tuple) is always a dense (B, 4096) uint8 tensor.
+        The 7-tuple (similarity-term ablation) is checked first: 7 is outside
+        {2, 4, 5} so the legacy branches below would mis-read prot_idx as y.
         """
+        if len(batch[0]) == 7:
+            voxs = torch.stack([b[0] for b in batch])
+            y = torch.stack([b[6] for b in batch])
+
+            def maybe_stack(lst):
+                if any(v is not None for v in lst):
+                    ref = next((x for x in lst if x is not None), None)
+                    return torch.stack(
+                        [torch.as_tensor(v) if v is not None else torch.zeros_like(torch.as_tensor(ref))
+                         for v in lst]
+                    )
+                return None
+
+            # a missing IFP (not in the parquet) is zero-padded: an all-zero
+            # fingerprint has Dice 0 with every other sample, so it is gated out
+            # of the IFP-aware loss and contributes no gradient.
+            ref = next((b[3] for b in batch if b[3] is not None), None)
+            ifps = [torch.as_tensor(b[3], dtype=torch.uint8) if b[3] is not None
+                    else torch.zeros(1 if ref is None else len(ref), dtype=torch.uint8)
+                    for b in batch]
+            prot_idx = torch.stack([torch.as_tensor(b[4], dtype=torch.long) for b in batch])
+            lig_idx = torch.stack([torch.as_tensor(b[5], dtype=torch.long) for b in batch])
+
+            return (voxs,
+                    maybe_stack([b[1] for b in batch]),
+                    maybe_stack([b[2] for b in batch]),
+                    torch.stack(ifps),
+                    prot_idx,
+                    lig_idx,
+                    y)
         if len(batch[0]) == 5:
             voxs = torch.stack([b[0] for b in batch])
             y = torch.stack([b[4] for b in batch])
 
             def maybe_stack(lst):
                 if any(v is not None for v in lst):
-                    ref = lst[0]
+                    ref = next((x for x in lst if x is not None), None)
                     return torch.stack(
                         [torch.as_tensor(v) if v is not None else torch.zeros_like(torch.as_tensor(ref))
                          for v in lst]
@@ -312,7 +416,7 @@ class PDBbind(pl.LightningDataModule):
 
             def maybe_stack(lst):
                 if any(v is not None for v in lst):
-                    ref = lst[0]
+                    ref = next((x for x in lst if x is not None), None)
                     return torch.stack(
                         [torch.as_tensor(v) if v is not None else torch.zeros_like(torch.as_tensor(ref))
                          for v in lst]
@@ -368,6 +472,9 @@ class VoxelDataset(Dataset):
         ifp: Optional[list] = None,
         skip_voxel: bool = False,
         ids: Optional[list[str]] = None,
+        prot_idx: Optional[list] = None,
+        lig_idx: Optional[list] = None,
+        sim_terms: Optional[list] = None,
     ):
         assert len(protein_files) == len(ligand_files), "must have the same length!"
         assert len(protein_files) == len(labels), "must have the same length!"
@@ -379,6 +486,10 @@ class VoxelDataset(Dataset):
             assert len(ifp) == len(labels), "ifp must be aligned with labels!"
         if ids is not None:
             assert len(ids) == len(labels), "ids must be aligned with labels!"
+        if prot_idx is not None:
+            assert len(prot_idx) == len(labels), "prot_idx must be aligned with labels!"
+        if lig_idx is not None:
+            assert len(lig_idx) == len(labels), "lig_idx must be aligned with labels!"
 
         self.ptn_files = protein_files
         self.lig_files = ligand_files
@@ -396,6 +507,9 @@ class VoxelDataset(Dataset):
         self.ifp = ifp
         self.skip_voxel = skip_voxel
         self.ids = ids
+        self.prot_idx = prot_idx
+        self.lig_idx = lig_idx
+        self.sim_terms = list(sim_terms or [])
 
     def __len__(self) -> int:
         return len(self.labels)
@@ -414,6 +528,12 @@ class VoxelDataset(Dataset):
         return "protein" if beta < 0.5 else "ligand"
 
     def __getitem__(self, idx):
+        # canonical 7-tuple (voxs, e_prot, e_lig, ifp|None, prot_idx, lig_idx, y)
+        # when the similarity-term ablation is active; the two row indices are
+        # ints built from the id->row maps in _get_dataset.
+        prot_idx = self.prot_idx[idx] if self.prot_idx is not None else None
+        lig_idx = self.lig_idx[idx] if self.lig_idx is not None else None
+        sim = self.sim_terms
         if self.skip_voxel:
             # ablacao --no-cnn: o modelo ignora `voxs`, entao nem o complexo nem o
             # grid sao construidos. Devolve um placeholder so para manter a forma
@@ -424,7 +544,11 @@ class VoxelDataset(Dataset):
             e_prot = self.e_prot[idx] if self.e_prot is not None else None
             e_lig = self.e_lig[idx] if self.e_lig is not None else None
             if self.ifp is not None:
+                if sim:
+                    return voxs, e_prot, e_lig, self.ifp[idx], prot_idx, lig_idx, self.labels[idx]
                 return voxs, e_prot, e_lig, self.ifp[idx], self.labels[idx]
+            if sim:
+                return voxs, e_prot, e_lig, None, prot_idx, lig_idx, self.labels[idx]
             return voxs, e_prot, e_lig, self.labels[idx]
 
         molecule = docktgrid.molecule.MolecularComplex(
@@ -465,6 +589,12 @@ class VoxelDataset(Dataset):
             if masked_unit == "ligand" and e_lig is not None:
                 e_lig = np.zeros_like(e_lig)
             if self.ifp is not None:
+                if sim:
+                    return voxs, e_prot, e_lig, self.ifp[idx], prot_idx, lig_idx, label
                 return voxs, e_prot, e_lig, self.ifp[idx], label
+            if sim:
+                return voxs, e_prot, e_lig, None, prot_idx, lig_idx, label
             return voxs, e_prot, e_lig, label
+        if sim:
+            return voxs, None, None, None, prot_idx, lig_idx, label
         return voxs, label

@@ -63,6 +63,8 @@ def parse_args():
     p.add_argument("--val-frac", type=float, default=0.18,
                    help="Fraction of each outer training pool reserved as a grouped "
                         "validation slice.")
+    p.add_argument("--in-domain-val-frac", type=float, default=0.10,
+                   help="Fraction of in-domain training complexes sampled for mixed validation.")
     p.add_argument("--require-embeddings", type=Path, default=None,
                    help="Embeddings dir. When given, keep only complexes that have BOTH an "
                         "ESM-2 and a ChemBERTa vector on disk. Without this the 2^3 grid is "
@@ -218,6 +220,37 @@ def main():
               f"test={int((df[col] == 'test').sum())} "
               f"({len(fold_clusters)} test clusters"
               f"{', mega' if mega in fold_clusters else ''})")
+
+        # --- Mixed Validation column (OOD + In-Domain validation) ---
+        mix_col = f"grp_mixval_o{o}"
+        mix_strat_col = f"grp_mixval_stratum_o{o}"
+        df[mix_col] = pd.Series(np.nan, index=df.index, dtype=object)
+        df[mix_strat_col] = pd.Series(np.nan, index=df.index, dtype=object)
+
+        in_train_pool = in_dev & ~in_val & ~in_fold
+        train_indices = df[in_train_pool].index.to_numpy().copy()
+        rng.shuffle(train_indices)
+        n_in_val = int(len(train_indices) * args.in_domain_val_frac)
+        val_in_idx = train_indices[:n_in_val]
+        train_idx = train_indices[n_in_val:]
+
+        df.loc[train_idx, mix_col] = "train"
+        df.loc[train_idx, mix_strat_col] = "train"
+
+        df.loc[in_val, mix_col] = "validation"
+        df.loc[in_val, mix_strat_col] = "val_ood"
+
+        df.loc[val_in_idx, mix_col] = "validation"
+        df.loc[val_in_idx, mix_strat_col] = "val_in"
+
+        df.loc[in_fold, mix_col] = "test"
+        df.loc[in_fold, mix_strat_col] = "test_ood"
+
+        print(f"  {mix_col}: train={int((df[mix_col] == 'train').sum())} "
+              f"val={int((df[mix_col] == 'validation').sum())} "
+              f"(val_ood={int((df[mix_strat_col] == 'val_ood').sum())}, "
+              f"val_in={int((df[mix_strat_col] == 'val_in').sum())}) "
+              f"test={int((df[mix_col] == 'test').sum())}")
 
     # --- 3. final refit column: train on dev, evaluate on the frozen hold-out ---
     pool = {c: n for c, n in dev_sizes.items() if c != mega}
