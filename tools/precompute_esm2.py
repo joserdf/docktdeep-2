@@ -29,7 +29,10 @@ import torch
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 MODELS = {
-    # esm2-3B (~3B, 2560-d) needs ~24GB VRAM with long sequences -> diamante GPU.
+    # Os grandes so cabem em fp16: 3B sao 11GB em fp32 (estoura a 3060 de 12GB
+    # antes das ativacoes) e 15B sao ~60GB. Use --dtype float16 para eles.
+    "esm2-15B": ("facebook/esm2_t48_15B_UR50D", 5120),
+    "esm2-3B": ("facebook/esm2_t36_3B_UR50D", 2560),
     "esm2-650M": ("facebook/esm2_t33_650M_UR50D", 1280),
     "esm2-150M": ("facebook/esm2_t30_150M_UR50D", 640),
     "esm2-35M": ("facebook/esm2_t12_35M_UR50D", 480),
@@ -49,6 +52,13 @@ def parse_args():
                    help="Limit number of sequences (sanity).")
     p.add_argument("--max-length", type=int, default=1024,
                    help="Truncate sequences longer than this (ESM-2 supports up to 1022 tokens).")
+    p.add_argument("--device-map", type=str, default=None,
+                   help="device_map do accelerate (ex.: auto). Necessario para o 15B: "
+                        "sao ~30GB em fp16 e nao cabem nos 24GB de uma 4090; o que "
+                        "nao couber transborda p/ RAM. Exige --batch-size alto.")
+    p.add_argument("--dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"],
+                   help="dtype dos PESOS. float32 e o default historico (650M e menores foram "
+                        "gerados assim); 3B/15B so cabem em float16.")
     return p.parse_args()
 
 
@@ -84,16 +94,27 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"\n=== {key} ({model_id}, dim={dim}) ===")
         tok = AutoTokenizer.from_pretrained(model_id)
-        model = AutoModel.from_pretrained(model_id)
-        model.to(device).eval()
+        weight_dtype = getattr(torch, args.dtype)
+        if args.device_map:
+            model = AutoModel.from_pretrained(model_id, torch_dtype=weight_dtype,
+                                              device_map=args.device_map)
+        else:
+            model = AutoModel.from_pretrained(model_id, torch_dtype=weight_dtype)
+            model.to(device)
+        model.eval()
         use_amp = device == "cuda"
         dtype = torch.float16 if use_amp else torch.float32
+        pending = [(h, s) for h, s in seqs if not (out_dir / f"{h}.npy").exists()]
+        # Ordenar por tamanho agrupa sequencias parecidas no mesmo batch: com
+        # padding dinamico isso corta o desperdicio (as unicas vao de ~30 a 1022
+        # residuos). A ordem nao importa — cada saida e nomeada pelo hash.
+        pending.sort(key=lambda hs: len(hs[1]))
+        bs = max(1, args.batch_size)
+        print(f"  {len(pending)} pendentes, batch={bs}")
         with torch.no_grad():
-            for h, seq in seqs:
-                out_file = out_dir / f"{h}.npy"
-                if out_file.exists():
-                    continue
-                inp = tok([seq], return_tensors="pt", padding=True,
+            for i in range(0, len(pending), bs):
+                chunk = pending[i:i + bs]
+                inp = tok([s for _, s in chunk], return_tensors="pt", padding=True,
                           truncation=True, max_length=args.max_length).to(device)
                 with torch.autocast(device_type="cuda", dtype=dtype, enabled=use_amp):
                     out = model(**inp).last_hidden_state
@@ -101,7 +122,9 @@ def main():
                 mask = inp["attention_mask"].unsqueeze(-1).float()
                 pooled = (out * mask).sum(1) / mask.sum(1)
                 pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
-                np.save(out_file, pooled.cpu().numpy()[0])
+                arr = pooled.cpu().numpy()
+                for j, (h, _) in enumerate(chunk):
+                    np.save(out_dir / f"{h}.npy", arr[j])
         del model, tok
         if device == "cuda":
             torch.cuda.empty_cache()
