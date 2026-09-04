@@ -4,47 +4,9 @@ import lightning.pytorch as pl
 import torch
 import torch.nn.functional as F
 
+from .blocks import ConvGroupDepthwise
+
 __all__ = ["STN"]
-
-
-class ConvGroupDepthwise(torch.nn.Sequential):
-    def __init__(self, in_c, out_c, kernel_size, **kwargs):
-        super().__init__(
-            self.depthwise_separable_conv(in_c, out_c, kernel_size, **kwargs),
-            torch.nn.BatchNorm3d(out_c),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.MaxPool3d((2, 2, 2)),
-        )
-
-    def depthwise_separable_conv(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 5,
-        stride: int = 1,
-        padding: int = 2,
-        kernels_per_layer: int = 1,
-    ):
-        """3D depthwise conv layer."""
-        conv3d = torch.nn.Conv3d(
-            in_channels=in_channels,
-            out_channels=in_channels * kernels_per_layer,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            groups=in_channels,
-            bias=False,
-        )
-        pointwise_conv = torch.nn.Conv3d(
-            in_channels=in_channels * kernels_per_layer,
-            out_channels=out_channels,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            bias=False,
-        )
-
-        return torch.nn.Sequential(conv3d, pointwise_conv)
 
 
 class LocalizationNet(torch.nn.Module):

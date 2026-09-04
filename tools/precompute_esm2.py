@@ -56,6 +56,10 @@ def parse_args():
                    help="device_map do accelerate (ex.: auto). Necessario para o 15B: "
                         "sao ~30GB em fp16 e nao cabem nos 24GB de uma 4090; o que "
                         "nao couber transborda p/ RAM. Exige --batch-size alto.")
+    p.add_argument("--max-gpu-mem", type=str, default=None,
+                   help="teto da fatia na GPU com --device-map (ex.: 6GiB). Sem isto o "
+                        "accelerate toma toda a memoria livre — indelicado numa GPU "
+                        "compartilhada, onde o job do outro usuario ainda pode crescer.")
     p.add_argument("--dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"],
                    help="dtype dos PESOS. float32 e o default historico (650M e menores foram "
                         "gerados assim); 3B/15B so cabem em float16.")
@@ -96,8 +100,11 @@ def main():
         tok = AutoTokenizer.from_pretrained(model_id)
         weight_dtype = getattr(torch, args.dtype)
         if args.device_map:
+            kw = {}
+            if args.max_gpu_mem:
+                kw["max_memory"] = {0: args.max_gpu_mem, "cpu": "40GiB"}
             model = AutoModel.from_pretrained(model_id, torch_dtype=weight_dtype,
-                                              device_map=args.device_map)
+                                              device_map=args.device_map, **kw)
         else:
             model = AutoModel.from_pretrained(model_id, torch_dtype=weight_dtype)
             model.to(device)

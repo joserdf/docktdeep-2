@@ -1,0 +1,49 @@
+# K=['aff', 'prot', 'lig']
+# Célula s14_aff_prot_lig — ablação de termos de similaridade (fator C), grade 2^4 + ∅.
+# K = ['aff', 'prot', 'lig']
+# Base: arr05 (CNN base, random_split, merge-val-test) + Huber + label-smoothing
+# 0.05 + RDrop@0.025. yaware OFF (default). λ_k = λ0 = 0.025; orçamento 0.125.
+factors:
+  esm2: off
+  chemberta: off
+  semi: on
+  sim_terms: [aff, prot, lig]      # subconjunto de {ifp, aff, prot, lig}
+  yaware: false                # obrigatório (R0 senão herdaria o InfoNCE antigo)
+
+model: Baseline
+
+data:
+  dataframe_path: data/pdbbind2020/index-pfam.csv
+  root_dir: data/pdbbind2020/processed
+  split_column: random_split
+  target_column: pki
+  merge_val_test: true
+  batch_size: 64
+  num_workers: 8
+  vox_size: 1.0
+  box_dims: [24.0, 24.0, 24.0]
+  view: ["VolumeView", "BasicView"]
+  occupancy: gaussian
+  random_rotation: true
+
+train:
+  max_epochs: 200
+  optimizer: AdamW
+  lr: 0.00087469
+  beta1: 0.25693012
+  eps: 0.00032933
+  dropout: 0.25348994
+  wdecay: 0.0000169
+  molecular_dropout: 0.06
+  molecular_dropout_unit: complex
+  depthwise_convs: true
+  adaptive_pooling: true
+  loss: huber
+  label_smoothing: 0.05
+  lambda_semi: 0.025     # RDrop
+  sim_lambda: 0.025      # cada termo de similaridade
+  sim_lambda_max: 0.125  # orçamento do bloco
+  sim_mat_dir: data/embeddings/sim
+  sim_prot_map: data/embeddings/sim/prot_map.json
+  sim_lig_map: data/embeddings/sim/lig_map.json
+# (sem termo ifp: sem --ifp-path)

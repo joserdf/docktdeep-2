@@ -125,6 +125,7 @@ def emit_metrics_line(trainer, model, args) -> None:
     # mesmos criterios do on_train_end do modelo, para a linha bater com o Aim
     best_pearsonr = max(logs, key=lambda x: x["val_pearsonr"])
     best_loss = min(logs, key=lambda x: x["val_loss"])
+    best_mae = min(logs, key=lambda x: x["val_mae"])
     # resume: o melhor val_pearsonr pode ter sido alcancado no 1o half (pre-pause);
     # model._prior_best_pearsonr e preenchido em run() quando --prior-best-path existe
     prior = getattr(model, "_prior_best_pearsonr", None)
@@ -134,8 +135,13 @@ def emit_metrics_line(trainer, model, args) -> None:
         best_pearsonr_val = float(best_pearsonr["val_pearsonr"])
     metrics = {
         "best_val_pearsonr": best_pearsonr_val,
+        # o objetivo da busca e um maximo sobre epocas: quanto mais tempo o trial
+        # treina, mais sorteios ele tem. Publicar a ultima epoca ao lado torna
+        # esse vies mensuravel em vez de suposto.
+        "final_val_pearsonr": float(logs[-1]["val_pearsonr"]),
         "best_val_loss": float(best_loss["val_loss"]),
-        "best_val_mae": float(best_loss["val_mae"]),
+        "best_val_mae": float(best_mae["val_mae"]),
+        "val_mae_at_best_loss": float(best_loss["val_mae"]),
         "epochs": trainer.current_epoch,
     }
     for name, value in trainer.callback_metrics.items():

@@ -39,6 +39,10 @@ class PDBbind(pl.LightningDataModule):
         use_chemberta: bool = False,
         embeddings_dir: str = "data/embeddings",
         esm2_model: str = "esm2-650M",
+        contrastive_esm2_model: str = "",  # ESM-2 do contrastivo quando --use-esm2 esta off
+        semi: bool = False,  # lido do modelo: decide se os lambdas abaixo valem alguma coisa
+        lambda_prot: float = 0.0,
+        lambda_lig: float = 0.0,
         no_cnn: bool = False,
         ifp_path: str = "",  # optional PLEC IFP parquet (id + ifp_<0..4095>); feeds the IFP-aware yaware
         sim_terms: list = [],  # similarity terms active (ifp/aff/prot/lig); triggers the canonical 7-tuple
@@ -68,6 +72,30 @@ class PDBbind(pl.LightningDataModule):
         self.use_chemberta = use_chemberta
         self.embeddings_dir = embeddings_dir
         self.esm2_model = esm2_model
+
+        # Um embedding entra no batch quando o RAMO o consome (--use-esm2 /
+        # --use-chemberta) ou quando o CONTRASTIVO o usa como ancora
+        # (--lambda-prot / --lambda-lig sob --semi). Sao usos independentes: o
+        # termo de cosseno so precisa do vetor congelado para montar a matriz de
+        # similaridade alvo, nunca o alimenta ao modelo.
+        contrastive = bool(semi)
+        self.need_e_prot = use_esm2 or (contrastive and float(lambda_prot) > 0.0)
+        self.need_e_lig = use_chemberta or (contrastive and float(lambda_lig) > 0.0)
+
+        # So um vetor de proteina por amostra atravessa o batch. Com o ramo
+        # ligado ele manda na escolha e o contrastivo reaproveita o mesmo; com o
+        # ramo desligado a escolha e livre. Pedir os dois ao mesmo tempo exigiria
+        # carregar dois embeddings por amostra, que o pipeline nao faz -- entao
+        # falha aqui em vez de descartar em silencio o que o usuario pediu.
+        if use_esm2 and contrastive_esm2_model and contrastive_esm2_model != esm2_model:
+            raise ValueError(
+                f"--contrastive-esm2-model {contrastive_esm2_model} conflita com "
+                f"--esm2-model {esm2_model}: com --use-esm2 ligado o contrastivo "
+                f"reusa o embedding do ramo. Deixe --contrastive-esm2-model vazio "
+                f"ou desligue --use-esm2."
+            )
+        self.contrastive_esm2_model = contrastive_esm2_model
+        self.e_prot_model = esm2_model if use_esm2 else (contrastive_esm2_model or esm2_model)
         self.no_cnn = no_cnn
         self.ifp_path = ifp_path
         self._ifp_dict = None  # lazily-loaded {id: uint8[4096]} when ifp_path set
@@ -103,6 +131,7 @@ class PDBbind(pl.LightningDataModule):
         parser.add_argument("--use-chemberta", action="store_true", default=False, help="Condition on frozen ChemBERTa ligand embeddings (factor B).")
         parser.add_argument("--embeddings-dir", type=str, default="data/embeddings", help="Dir with cached embeddings and mapping jsons.")
         parser.add_argument("--esm2-model", type=str, default="esm2-650M", help="ESM-2 model key used for cached protein embeddings.")
+        parser.add_argument("--contrastive-esm2-model", type=str, default="", help="ESM-2 model key used ONLY as the contrastive anchor (--lambda-prot under --semi) when --use-esm2 is off, i.e. when the protein embedding is not an input to the model. Empty follows --esm2-model. Setting it to a different key while --use-esm2 is on is an error: only one protein embedding per sample travels in the batch.")
         parser.add_argument("--ifp-path", type=str, default="", help="Path to PLEC IFP parquet (columns id + ifp_0..ifp_4095). When set, each sample carries its binary 4096-bit interaction fingerprint in the batch for the IFP-aware yaware loss (--ifp-aware).")
         # --sim-mat-dir is registered by the MODEL (Baseline.add_specific_args); the
         # datamodule only consumes its value (sentinel index) via vars(args). Same for
@@ -218,6 +247,25 @@ class PDBbind(pl.LightningDataModule):
             e_lig = [e_lig[i] for i in idx] if e_lig is not None else None
             print(f"  ({split}) removidos por embedding ausente: {len(keep) - len(idx)}")
 
+        # Um embedding que so serve de ancora contrastiva nao passa pelo filtro
+        # acima: a amostra continua treinavel sem ele, e o vetor zerado apenas
+        # nao rende parceiro positivo. Mas se o cache inteiro estiver faltando
+        # (ex.: --contrastive-esm2-model esm2-3B sem o diretorio precomputado) o
+        # termo morre em silencio e o trial fica registrado como se tivesse sido
+        # testado. Entao: nenhum ausente e tolerado em silencio se TODOS faltam.
+        for nome, ativo, ramo, vals in (
+            ("e_prot", self.need_e_prot, self.use_esm2, e_prot),
+            ("e_lig", self.need_e_lig, self.use_chemberta, e_lig),
+        ):
+            if ativo and not ramo and vals is not None and not any(v is not None for v in vals):
+                alvo = self.e_prot_model if nome == "e_prot" else "chemberta"
+                raise RuntimeError(
+                    f"({split}) o contrastivo pediu {nome} mas nenhuma das "
+                    f"{len(vals)} amostras tem embedding em "
+                    f"{os.path.join(self.embeddings_dir, 'esm2' if nome == 'e_prot' else '', alvo)}. "
+                    f"Precompute o cache ou zere o lambda correspondente."
+                )
+
         if split == "validation":
             stratum_col = self.stratum_column
             if not stratum_col:
@@ -300,24 +348,24 @@ class PDBbind(pl.LightningDataModule):
         e_lig: per-sample ChemBERTa vector (or None for that sample) from the cache.
         Missing entities yield None so the dataloader can still batch the sample.
         """
-        if not (self.use_esm2 or self.use_chemberta):
+        if not (self.need_e_prot or self.need_e_lig):
             return None, None
 
         ed = self.embeddings_dir
-        c2s = json.load(open(os.path.join(ed, "complex_to_seq.json"))) if self.use_esm2 else {}
-        c2sm = json.load(open(os.path.join(ed, "complex_to_smiles.json"))) if self.use_chemberta else {}
+        c2s = json.load(open(os.path.join(ed, "complex_to_seq.json"))) if self.need_e_prot else {}
+        c2sm = json.load(open(os.path.join(ed, "complex_to_smiles.json"))) if self.need_e_lig else {}
 
         def _load(path):
             return np.load(path) if path is not None else None
 
         e_prot = None
         e_lig = None
-        if self.use_esm2:
+        if self.need_e_prot:
             e_prot = [
-                _load(os.path.join(ed, "esm2", self.esm2_model, f"{c2s.get(cid)}.npy") if c2s.get(cid) else None)
+                _load(os.path.join(ed, "esm2", self.e_prot_model, f"{c2s.get(cid)}.npy") if c2s.get(cid) else None)
                 for cid in sample_ids
             ]
-        if self.use_chemberta:
+        if self.need_e_lig:
             e_lig = [
                 _load(os.path.join(ed, "chemberta", f"{hashlib.sha1(c2sm[cid].encode()).hexdigest()[:16]}.npy")
                       if c2sm.get(cid) else None)

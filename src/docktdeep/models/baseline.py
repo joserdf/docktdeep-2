@@ -6,265 +6,249 @@ import lightning.pytorch as pl
 import torch
 import torch.nn.functional as F
 from torchmetrics.functional.regression import (
-    mean_absolute_percentage_error,
     mean_squared_error,
     r2_score,
     spearman_corrcoef,
-    symmetric_mean_absolute_percentage_error,
 )
 from torchmetrics.regression import MeanAbsoluteError
 
+from . import losses
+from .cnn import build_voxel_encoder
+from .embeddings import E_LIG_DIM, build_embedding_projection, esm2_dim
+from .heads import build_projection_head, build_regression_head
+from .latent import build_latent_projection
+
 __all__ = ["Baseline"]
 
-# ESM-2 model key -> embedding dim (matches tools/precompute_esm2.py).
-ESM2_DIMS = {
-    "esm2-650M": 1280,
-    "esm2-3B": 2560,
-    "esm2-15B": 5120,
-    "esm2-150M": 640,
-    "esm2-35M": 480,
-    "esm2-8M": 320,
-}
-E_LIG_DIM = 768  # ChemBERTa (zinc-base)
-
-
-class ConvGroup(torch.nn.Sequential):
-    def __init__(self, in_c, out_c, kernel_size, **kwargs):
-        super().__init__(
-            torch.nn.Conv3d(
-                in_c,
-                out_c,
-                kernel_size=kernel_size,
-                padding="same",
-                bias=False,
-                **kwargs,
-            ),
-            torch.nn.BatchNorm3d(out_c),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.MaxPool3d((2, 2, 2)),
-        )
-
-
-class ConvGroupDepthwise(torch.nn.Sequential):
-    def __init__(self, in_c, out_c, kernel_size, **kwargs):
-        super().__init__(
-            self.depthwise_separable_conv(in_c, out_c, kernel_size, **kwargs),
-            torch.nn.BatchNorm3d(out_c),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.MaxPool3d((2, 2, 2)),
-        )
-
-    def depthwise_separable_conv(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 5,
-        stride: int = 1,
-        padding: int = 2,
-        kernels_per_layer: int = 1,
-    ):
-        """3D depthwise conv layer."""
-        conv3d = torch.nn.Conv3d(
-            in_channels=in_channels,
-            out_channels=in_channels * kernels_per_layer,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            groups=in_channels,
-            bias=False,
-        )
-        pointwise_conv = torch.nn.Conv3d(
-            in_channels=in_channels * kernels_per_layer,
-            out_channels=out_channels,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            bias=False,
-        )
-
-        return torch.nn.Sequential(conv3d, pointwise_conv)
-
-
-class FCGroup(torch.nn.Sequential):
-    def __init__(self, in_c, out_c, dropout_rate, **kwargs):
-        super().__init__(
-            torch.nn.Linear(in_c, out_c, bias=False),
-            torch.nn.BatchNorm1d(1000),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Dropout(dropout_rate),
-        )
+# Piso de amostras para reportar metrica de um estrato. Pearson sobre 2 pontos e
+# +-1 por construcao, entao um piso baixo enche o log de correlacoes perfeitas
+# que nao dizem nada. Cada estrato tambem publica o proprio n, para que o piso
+# nunca precise ser adivinhado a partir da tabela.
+MIN_STRATUM_N = 10
 
 
 class Baseline(pl.LightningModule):
+    """Regressor de afinidade sobre grade de voxels + embeddings congelados.
+
+    A arquitetura e montada por construtores externos, e cada um deles vira um
+    atributo de primeiro nivel:
+
+        conv_layers / flatten  (cnn.py)         grade 3D -> features
+        proj_prot / proj_lig   (embeddings.py)  ESM-2 / ChemBERTa condicionados
+        latent_proj            (latent.py)      concat `u` -> latente `z`
+        head                   (heads.py)       cabeca de regressao sobre `z`
+        proj_head              (heads.py)       p(z), objetivo do fator C
+
+    O caminho e sempre o mesmo:
+
+        u = concat(flatten(conv(x)), proj_prot(e_p), proj_lig(e_l))
+        z = latent_proj(u)        # ou z = u, com --latent-dim 0
+        y = head(z)               # contrastivo em p(z)
+
+    Os nomes desses atributos sao as chaves do `state_dict`: renomea-los ou
+    aninha-los num submodulo invalida todos os checkpoints ja treinados.
+    """
+
     def __init__(self, input_size: tuple[int], **kwargs):
         super().__init__()
         self.save_hyperparameters()
-        self.loss_fn = torch.nn.MSELoss() # Try: L1Loss, SmoothL1Loss, HuberLoss
         self.mae = MeanAbsoluteError()
         self.train_step_outputs = []
         self.validation_step_outputs = []
         self.test_step_outputs = []
         self.validation_logs = []
 
-        use_esm2 = bool(self.hparams.get("use_esm2", False))
-        use_chemberta = bool(self.hparams.get("use_chemberta", False))
-        semi = bool(self.hparams.get("semi", False))
-        no_cnn = bool(self.hparams.get("no_cnn", False))
-        f_dim = int(self.hparams.get("f_dim", 512))
-        emb_proj_dim = int(self.hparams.get("emb_proj_dim", 128))
-        proj_dim = int(self.hparams.get("proj_dim", 128))
+        self._build_architecture(input_size)
+        self._configure_objective()
 
-        # `no_cnn` ablates the whole convolutional branch: the latent `f` then
-        # comes from the projected embeddings instead of the voxel grid, so the
-        # head, the semi head and the dataloader all lose the structural input.
-        self.no_cnn = no_cnn
-        if no_cnn:
+    # ----------------------------------------------------------------- #
+    # construcao
+    # ----------------------------------------------------------------- #
+    def _build_architecture(self, input_size: tuple[int]) -> None:
+        hp = self.hparams
+        use_esm2 = bool(hp.get("use_esm2", False))
+        use_chemberta = bool(hp.get("use_chemberta", False))
+        self.use_esm2 = use_esm2
+        self.use_chemberta = use_chemberta
+
+        # `no_cnn` ablates the whole convolutional branch: `u` then comes from
+        # the projected embeddings instead of the voxel grid, so the head, the
+        # semi head and the dataloader all lose the structural input.
+        self.no_cnn = bool(hp.get("no_cnn", False))
+
+        if self.no_cnn:
             if not (use_esm2 or use_chemberta):
                 raise ValueError("--no-cnn requires --use-esm2 and/or --use-chemberta: "
                                  "without the CNN and without embeddings the model has no input.")
             self.conv_layers = None
             self.flatten = None
-            self.f_proj = None
-            base_dim = emb_proj_dim * (int(use_esm2) + int(use_chemberta))
+            cnn_dim = 0
         else:
-            conv = ConvGroup if not self.hparams.depthwise_convs else ConvGroupDepthwise
-            conv1 = conv(input_size[0], 64, 5)
-            conv2 = conv(64, 128, 5)
-            conv3 = conv(128, 256, 5)
-            self.conv_layers = torch.nn.Sequential(conv1, conv2, conv3)
-
-            polling = torch.nn.AdaptiveAvgPool3d((2, 2, 2))
-            flatten = torch.nn.Flatten()
-            self.flatten = (
-                torch.nn.Sequential(polling, flatten)
-                if self.hparams.adaptive_pooling
-                else flatten
+            self.conv_layers, self.flatten, cnn_dim = build_voxel_encoder(
+                in_channels=input_size[0],
+                depthwise_convs=hp.depthwise_convs,
+                adaptive_pooling=hp.adaptive_pooling,
             )
-
-            # compact deterministic latent `f`
-            flat_dim = 256 * (2**3 if self.hparams.adaptive_pooling else 3**3)
-            self.f_proj = torch.nn.Sequential(
-                torch.nn.Linear(flat_dim, f_dim, bias=False),
-                torch.nn.BatchNorm1d(f_dim),
-                torch.nn.ReLU(inplace=True),
-            )
-            base_dim = f_dim
 
         # embedding conditioning projections (factors A / B)
-        self.emb_proj_dim = emb_proj_dim
-        self.proj_prot = None
-        self.proj_lig = None
-        if use_esm2:
-            e_prot_dim = ESM2_DIMS.get(self.hparams.get("esm2_model", "esm2-650M"), 1280)
-            self.proj_prot = torch.nn.Sequential(
-                torch.nn.Linear(e_prot_dim, emb_proj_dim, bias=False),
-                torch.nn.BatchNorm1d(emb_proj_dim),
-                torch.nn.ReLU(inplace=True),
-            )
-        if use_chemberta:
-            self.proj_lig = torch.nn.Sequential(
-                torch.nn.Linear(E_LIG_DIM, emb_proj_dim, bias=False),
-                torch.nn.BatchNorm1d(emb_proj_dim),
-                torch.nn.ReLU(inplace=True),
-            )
+        #
+        # Cada ramo tem a sua largura. Uma largura unica forcava ESM-2 (1280 ou
+        # 2560) e ChemBERTa (768) ao mesmo destino, e com o default de 128 isso
+        # era 10x a 20x de compressao contra os 6912 dims que a CNN despeja em
+        # `u` -- os embeddings ficavam com 1.8% a 3.6% da concatenacao.
+        #
+        # Largura 0 remove a projecao: o embedding congelado entra cru em `u`.
+        # Sem a BatchNorm do `linear_bn_relu` ele chega numa escala que nao e a
+        # da saida da CNN (pos-BN, pos-ReLU); e uma opcao de busca legitima, nao
+        # um default seguro.
+        e_prot_dim = esm2_dim(hp.get("esm2_model", "esm2-650M"))
+        d_prot = self._branch_proj_dim(hp, "prot")
+        d_lig = self._branch_proj_dim(hp, "lig")
+        self.emb_proj_dim_prot = d_prot
+        self.emb_proj_dim_lig = d_lig
+        self.proj_prot = (
+            build_embedding_projection(e_prot_dim, d_prot)
+            if use_esm2 and d_prot > 0 else None
+        )
+        self.proj_lig = (
+            build_embedding_projection(E_LIG_DIM, d_lig)
+            if use_chemberta and d_lig > 0 else None
+        )
 
-        # prediction head over f (+ conditioned embeddings)
-        head_in = base_dim if no_cnn else (
-            base_dim + (emb_proj_dim if use_esm2 else 0) + (emb_proj_dim if use_chemberta else 0))
-        fc_units = list(self.hparams.num_fc_units)
-        self.head = torch.nn.Sequential()
-        prev = head_in
-        for u in fc_units:
-            self.head.append(torch.nn.Linear(prev, u, bias=False))
-            self.head.append(torch.nn.BatchNorm1d(u))
-            self.head.append(torch.nn.ReLU(inplace=True))
-            self.head.append(torch.nn.Dropout(self.hparams.dropout))
-            prev = u
-        self.head.append(torch.nn.Linear(prev, 1))
+        # `u`: concatenacao dos ramos ligados. `z`: o espaco latente onde o
+        # contrastivo age e de onde a cabeca de regressao le. Com --latent-dim 0
+        # nao ha gargalo e z == u, o que sem embeddings reproduz o upstream.
+        self.u_dim = (
+            cnn_dim
+            + (0 if not use_esm2 else (d_prot or e_prot_dim))
+            + (0 if not use_chemberta else (d_lig or E_LIG_DIM))
+        )
+        latent_dim = int(hp.get("latent_dim", 512))
+        self.latent_proj = (
+            build_latent_projection(self.u_dim, latent_dim) if latent_dim > 0 else None
+        )
+        self.z_dim = latent_dim if latent_dim > 0 else self.u_dim
 
-        # projection head p(f) for the semi-supervised objective (factor C)
+        self.head = build_regression_head(
+            self.z_dim, list(hp.num_fc_units), hp.dropout
+        )
+
+        # projection head p(z) for the semi-supervised objective (factor C)
+        #
+        # Quais embeddings o contrastivo enxerga e uma pergunta separada de quais
+        # ramos o modelo consome. Um embedding pode ancorar `p(z)` sem nunca
+        # entrar em `u`: o termo de cosseno so precisa do vetor congelado. Por
+        # isso `proj_target` e dimensionado pelos lambdas, e nao por
+        # use_esm2/use_chemberta -- o dataloader aplica exatamente a mesma regra
+        # (PDBbind.need_e_prot / need_e_lig), entao as larguras casam.
+        semi = bool(hp.get("semi", False))
+        self.contrastive_prot = use_esm2 or (
+            semi and float(hp.get("lambda_prot", 0.0)) > 0.0
+        )
+        self.contrastive_lig = use_chemberta or (
+            semi and float(hp.get("lambda_lig", 0.0)) > 0.0
+        )
+        # Com o ramo ligado a ancora reusa o e_prot dele; so com o ramo desligado
+        # a escolha do ESM-2 e livre (o dataloader rejeita as duas de uma vez).
+        anchor_esm2 = (
+            hp.get("esm2_model", "esm2-650M") if use_esm2
+            else (hp.get("contrastive_esm2_model", "") or hp.get("esm2_model", "esm2-650M"))
+        )
         self.proj_head = None
         self.proj_target = None
         if semi:
-            self.proj_head = torch.nn.Sequential(
-                torch.nn.Linear(base_dim, proj_dim, bias=False),
-                torch.nn.ReLU(inplace=True),
-                torch.nn.Dropout(0.1),  # stochasticity for R-Drop consistency
-                torch.nn.Linear(proj_dim, proj_dim, bias=False),
+            proj_dim = int(hp.get("proj_dim", 128))
+            self.proj_head = build_projection_head(self.z_dim, proj_dim)
+            target_in = (esm2_dim(anchor_esm2) if self.contrastive_prot else 0) + (
+                E_LIG_DIM if self.contrastive_lig else 0
             )
-            target_in = 0
-            if use_esm2:
-                target_in += ESM2_DIMS.get(self.hparams.get("esm2_model", "esm2-650M"), 1280)
-            if use_chemberta:
-                target_in += E_LIG_DIM
             if target_in > 0:
                 self.proj_target = torch.nn.Linear(target_in, proj_dim, bias=False)
 
+    @staticmethod
+    def _branch_proj_dim(hp, sufixo: str) -> int:
+        """Largura da projecao de um ramo. -1 herda o `--emb-proj-dim` comum.
+
+        O sentinela existe para separar "nao pedi nada" de "pedi 0": 0 e uma
+        escolha (sem projecao), e o default compartilhado de 128 e o que todos
+        os trials ja rodados usaram.
+        """
+        v = int(hp.get(f"emb_proj_dim_{sufixo}", -1))
+        return int(hp.get("emb_proj_dim", 128)) if v < 0 else v
+
+    def _configure_objective(self) -> None:
+        """Perda de afinidade, pesos dos termos e validacao da configuracao."""
+        hp = self.hparams
+
         # affinity loss (Huber robust to experimental noise) + label smoothing
-        if self.hparams.get("loss", "mse") == "huber":
-            self.loss_fn = torch.nn.SmoothL1Loss(beta=self.hparams.get("huber_beta", 1.0))
+        if hp.get("loss", "mse") == "huber":
+            self.loss_fn = torch.nn.SmoothL1Loss(beta=hp.get("huber_beta", 1.0))
         else:
             self.loss_fn = torch.nn.MSELoss()
-        self.label_smoothing = float(self.hparams.get("label_smoothing", 0.0))
-        self.lambda_semi = float(self.hparams.get("lambda_semi", 1.0))
-        self.tau = float(self.hparams.get("semi_tau", 0.1))
-        self.yaware = bool(self.hparams.get("yaware", False))
-        self.yaware_sigma = float(self.hparams.get("yaware_sigma", 1.0))
-        self.ifp_tau = float(self.hparams.get("ifp_tau", 0.3))
+        self.label_smoothing = float(hp.get("label_smoothing", 0.0))
+        self.lambda_semi = float(hp.get("lambda_semi", 1.0))
+        self.tau = float(hp.get("semi_tau", 0.1))
+        self.yaware = bool(hp.get("yaware", False))
+        self.yaware_sigma = float(hp.get("yaware_sigma", 1.0))
+        self.ifp_tau = float(hp.get("ifp_tau", 0.3))
         # Anchor of the y-aware InfoNCE: how the soft-positive target is built.
         #   affinity  (arr05) tgt = exp(-|dy|/sigma)                    (pure yaware)
         #   gate  (N1)         tgt = exp(-|dy|/sigma) * [IFP_sim >= tau] (running now)
         #   ifp   (N2)         tgt = IFP_sim                             (pure IFP)
         #   hybrid(N3)         tgt = exp(-|dy|/sigma) * IFP_sim          (continuous weight)
         #   struct(10.5)       tgt = exp(-|dy|/sigma) * voxel_sim        (on-the-fly, no IFP)
-        anchor = str(self.hparams.get("anchor_mode", "affinity"))
-        if bool(self.hparams.get("ifp_aware", False)):
+        anchor = str(hp.get("anchor_mode", "affinity"))
+        if bool(hp.get("ifp_aware", False)):
             anchor = "gate"  # alias for backwards compat with the running N1 grid
         self.anchor_mode = anchor
-        self.lambda_aff = float(self.hparams.get("lambda_aff", 1.0))
-        self.lambda_ifp = float(self.hparams.get("lambda_ifp", 1.0))
-        self.lambda_prot = float(self.hparams.get("lambda_prot", 0.0))
-        self.lambda_lig = float(self.hparams.get("lambda_lig", 0.0))
-        self.auto_scale_loss = bool(self.hparams.get("auto_scale_loss", True))
+        self.lambda_aff = float(hp.get("lambda_aff", 1.0))
+        self.lambda_ifp = float(hp.get("lambda_ifp", 1.0))
+        self.lambda_prot = float(hp.get("lambda_prot", 0.0))
+        self.lambda_lig = float(hp.get("lambda_lig", 0.0))
+        self.auto_scale_loss = bool(hp.get("auto_scale_loss", True))
 
         # factor C decomposition: independent similarity terms (ifp/aff/prot/lig).
         # When --sim-terms is non-empty this path replaces the single y-aware
         # InfoNCE; the matrices are COMMON attributes (not register_buffer) so
         # ~370 MB never enter a .ckpt, and row indices come from the datamodule.
-        self.sim_terms = list(self.hparams.get("sim_terms", []))
-        self.sim_lambda = float(self.hparams.get("sim_lambda", 0.025))
-        self.sim_lambda_max = float(self.hparams.get("sim_lambda_max", 0.125))
-        self.sim_kendall = bool(self.hparams.get("sim_kendall", False))
-        self.sim_mat_dir = str(self.hparams.get("sim_mat_dir", ""))
+        self.sim_terms = list(hp.get("sim_terms", []))
+        self.sim_lambda = float(hp.get("sim_lambda", 0.025))
+        self.sim_lambda_max = float(hp.get("sim_lambda_max", 0.125))
+        self.sim_kendall = bool(hp.get("sim_kendall", False))
+        self.sim_mat_dir = str(hp.get("sim_mat_dir", ""))
         self.S_prot = None
         self.S_lig = None
         if self.sim_terms:
-            if self.sim_kendall:
-                raise NotImplementedError(
-                    "--sim-kendall is the phase-4.3 fallback (learned Kendall uncertainty "
-                    "weighting) and is not implemented yet; run the plain ablation first.")
-            if self.yaware:
-                raise ValueError("--sim-terms is incompatible with --yaware: the decomposed "
-                                 "similarity terms replace the y-aware InfoNCE.")
-            if bool(self.hparams.get("ifp_aware", False)):
-                raise ValueError("--sim-terms is incompatible with --ifp-aware "
-                                 "(alias that forces --anchor-mode gate).")
-            if self.anchor_mode != "affinity":
-                raise ValueError(
-                    f"--sim-terms is incompatible with --anchor-mode '{self.anchor_mode}': "
-                    "keep the default 'affinity' (the anchor is unused in the decomposed path).")
-            if "ifp" in self.sim_terms and not self.hparams.get("ifp_path"):
-                raise ValueError(
-                    "--sim-terms ifp requires --ifp-path: without it every ifp slot is None and "
-                    "L_ifp would be identically zero (a dead term) while the run looks healthy.")
-            # non-dominance budget: lambda_semi (RDrop) + one lambda per term must
-            # stay within the total block (D5: 5 x 0.025 = 0.125).
-            total = self.lambda_semi + len(self.sim_terms) * self.sim_lambda
-            if total > self.sim_lambda_max + 1e-9:
-                raise ValueError(
-                    f"similarity budget {total:.3f} (lambda_semi + |K|*sim_lambda) exceeds "
-                    f"--sim-lambda-max {self.sim_lambda_max}; lower --sim-lambda or --lambda-semi.")
+            self._validate_sim_terms()
             self._load_sim_matrices()
+
+    def _validate_sim_terms(self) -> None:
+        """Recusa combinacoes que produziriam um termo morto ou dominante."""
+        if self.sim_kendall:
+            raise NotImplementedError(
+                "--sim-kendall is the phase-4.3 fallback (learned Kendall uncertainty "
+                "weighting) and is not implemented yet; run the plain ablation first.")
+        if self.yaware:
+            raise ValueError("--sim-terms is incompatible with --yaware: the decomposed "
+                             "similarity terms replace the y-aware InfoNCE.")
+        if bool(self.hparams.get("ifp_aware", False)):
+            raise ValueError("--sim-terms is incompatible with --ifp-aware "
+                             "(alias that forces --anchor-mode gate).")
+        if self.anchor_mode != "affinity":
+            raise ValueError(
+                f"--sim-terms is incompatible with --anchor-mode '{self.anchor_mode}': "
+                "keep the default 'affinity' (the anchor is unused in the decomposed path).")
+        if "ifp" in self.sim_terms and not self.hparams.get("ifp_path"):
+            raise ValueError(
+                "--sim-terms ifp requires --ifp-path: without it every ifp slot is None and "
+                "L_ifp would be identically zero (a dead term) while the run looks healthy.")
+        # non-dominance budget: lambda_semi (RDrop) + one lambda per term must
+        # stay within the total block (D5: 5 x 0.025 = 0.125).
+        total = self.lambda_semi + len(self.sim_terms) * self.sim_lambda
+        if total > self.sim_lambda_max + 1e-9:
+            raise ValueError(
+                f"similarity budget {total:.3f} (lambda_semi + |K|*sim_lambda) exceeds "
+                f"--sim-lambda-max {self.sim_lambda_max}; lower --sim-lambda or --lambda-semi.")
 
     def _load_sim_matrices(self):
         """Load the precomputed similarity matrices as plain numpy arrays.
@@ -278,19 +262,166 @@ class Baseline(pl.LightningModule):
         if "lig" in self.sim_terms:
             self.S_lig = np.load(os.path.join(self.sim_mat_dir, "S_lig.npz"))["S"]
 
-    def forward(self, x, e_prot=None, e_lig=None):
-        if e_prot is not None and isinstance(e_prot, torch.Tensor) and e_prot.device != self.device:
-            e_prot = e_prot.to(self.device)
-        if e_lig is not None and isinstance(e_lig, torch.Tensor) and e_lig.device != self.device:
-            e_lig = e_lig.to(self.device)
-        f = self.forward_base_f(x, e_prot, e_lig)
-        if not self.no_cnn:  # sem CNN o `f` ja e a concatenacao das projecoes
-            if self.proj_prot is not None and e_prot is not None:
-                f = torch.cat([f, self.proj_prot(e_prot)], dim=1)
-            if self.proj_lig is not None and e_lig is not None:
-                f = torch.cat([f, self.proj_lig(e_lig)], dim=1)
-        return self.head(f)
+    # ----------------------------------------------------------------- #
+    # forward
+    # ----------------------------------------------------------------- #
+    def _to_device(self, *tensors):
+        """Traz para o device do modelo os embeddings que vieram soltos na CPU."""
+        return tuple(
+            t.to(self.device)
+            if isinstance(t, torch.Tensor) and t.device != self.device
+            else t
+            for t in tensors
+        )
 
+    def _concat_branches(self, x, e_prot, e_lig):
+        """`u`: concatenacao dos ramos ligados, antes do gargalo latente."""
+        parts = []
+        if not self.no_cnn:
+            parts.append(self.flatten(self.conv_layers(x)))
+        # `proj_* is None` com o ramo ligado significa largura 0: o embedding
+        # entra cru, sem projecao.
+        if self.use_esm2 and e_prot is not None:
+            parts.append(self.proj_prot(e_prot) if self.proj_prot is not None else e_prot)
+        if self.use_chemberta and e_lig is not None:
+            parts.append(self.proj_lig(e_lig) if self.proj_lig is not None else e_lig)
+        return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+
+    def forward_latent(self, x, e_prot=None, e_lig=None):
+        """Forward ate `z`, o espaco latente que alimenta as duas cabecas.
+
+        E aqui que o contrastivo age. Como `z` vem depois da concatenacao, o
+        gradiente dele atravessa o concat e chega em `proj_prot`/`proj_lig` —
+        o que nao acontecia quando o gargalo ficava antes.
+        """
+        e_prot, e_lig = self._to_device(e_prot, e_lig)
+        u = self._concat_branches(x, e_prot, e_lig)
+        z = self.latent_proj(u) if self.latent_proj is not None else u
+        self.last_z = z
+        return z
+
+    def forward(self, x, e_prot=None, e_lig=None):
+        return self.head(self.forward_latent(x, e_prot, e_lig))
+
+    # ----------------------------------------------------------------- #
+    # perdas (fator C) — a matematica vive em losses.py; aqui so o estado
+    # ----------------------------------------------------------------- #
+    def _contrastive_cfg(self) -> losses.ContrastiveConfig:
+        """Fotografa os hiperparametros contrastivos no estado atual.
+
+        Montado na hora, e nao no __init__, porque a suite de testes altera
+        `model.anchor_mode` entre chamadas.
+        """
+        return losses.ContrastiveConfig(
+            tau=self.tau,
+            yaware_sigma=self.yaware_sigma,
+            ifp_tau=self.ifp_tau,
+            anchor_mode=self.anchor_mode,
+            lambda_aff=self.lambda_aff,
+            lambda_ifp=self.lambda_ifp,
+            lambda_prot=self.lambda_prot,
+            lambda_lig=self.lambda_lig,
+            auto_scale_loss=self.auto_scale_loss,
+        )
+
+    def _ifp_sim(self, ifp):
+        return losses.ifp_dice_similarity(ifp)
+
+    def _voxel_sim(self, x):
+        return losses.voxel_similarity(x)
+
+    def _sim_infonce(self, p, tgt):
+        return losses.soft_infonce(p, tgt, self.tau)
+
+    def _aff_target(self, y):
+        return losses.affinity_target(y, self.yaware_sigma)
+
+    def _ifp_target(self, ifp):
+        return losses.ifp_target(ifp)
+
+    def _prot_target(self, prot_idx):
+        return losses.precomputed_target(prot_idx, self.S_prot)
+
+    def _lig_target(self, lig_idx):
+        return losses.precomputed_target(lig_idx, self.S_lig)
+
+    def _yaware_infonce(self, p, y, ifp=None, x=None, e_prot=None, e_lig=None,
+                        reg_loss=None):
+        return losses.yaware_infonce(
+            p, y, self._contrastive_cfg(), ifp=ifp, x=x,
+            e_prot=e_prot, e_lig=e_lig, reg_loss=reg_loss,
+        )
+
+    def _similarity_targets(self, prot_idx, lig_idx, ifp, y) -> dict:
+        """Alvo de cada termo ativo, na ordem em que `--sim-terms` os declarou."""
+        builders = {
+            "ifp": lambda: self._ifp_target(ifp),
+            "aff": lambda: self._aff_target(y),
+            "prot": lambda: self._prot_target(prot_idx),
+            "lig": lambda: self._lig_target(lig_idx),
+        }
+        targets = {}
+        for k in self.sim_terms:
+            if k not in builders:
+                raise ValueError(f"unknown sim term: {k}")
+            targets[k] = builders[k]()
+        return targets
+
+    def _sim_terms_loss(self, p, prot_idx, lig_idx, ifp, y):
+        """Weighted sum of the active similarity terms over the shared projection p.
+
+        Returns ``(weighted_total, per_term)`` where ``per_term[k] = (L_k, row_frac)``
+        with ``L_k`` the unweighted loss and ``row_frac`` the fraction of batch rows
+        that have at least one positive partner for that term.
+        """
+        targets = self._similarity_targets(prot_idx, lig_idx, ifp, y)
+        return losses.similarity_terms_loss(p, targets, self.tau, self.sim_lambda)
+
+    def _semi_loss(self, x, e_prot, e_lig, y, ifp=None, prot_idx=None, lig_idx=None,
+                   reg_loss=None):
+        """L_semi (factor C): consistency (R-Drop) + contrastive (y-aware or embedding-anchored).
+
+        With --sim-terms active it returns ``(rdrop, sim_block)``; otherwise a
+        scalar ``rdrop [+ contrastive]`` (legacy paths untouched).
+        """
+        self.train()  # enable dropout for stochastic passes
+        p1 = F.normalize(self.proj_head(self.forward_latent(x, e_prot, e_lig)), dim=1)
+        p2 = F.normalize(self.proj_head(self.forward_latent(x, e_prot, e_lig)), dim=1)
+        rdrop = F.mse_loss(p1, p2)  # consistency: align p(f) under two stochastic passes
+
+        if self.sim_terms:
+            return rdrop, self._sim_terms_loss(p1, prot_idx, lig_idx, ifp, y)
+
+        if self.yaware:
+            return rdrop + self._yaware_infonce(
+                p1, y, ifp, x=x, e_prot=e_prot, e_lig=e_lig, reg_loss=reg_loss)
+
+        return rdrop + self._embedding_anchored_loss(p1, e_prot, e_lig)
+
+    def _embedding_anchored_loss(self, p, e_prot, e_lig):
+        """InfoNCE que ancora p(f) no par (e_prot, e_lig) do proprio complexo.
+
+        Positivo e a diagonal: cada projecao contra o seu proprio embedding.
+        Sem embeddings disponiveis nao ha ancora e o termo desaparece.
+
+        A condicao e `contrastive_*`, nao `proj_* is not None`: um embedding
+        ancora a projecao mesmo quando o ramo que o consumiria esta desligado.
+        """
+        parts = []
+        if self.contrastive_prot and e_prot is not None:
+            parts.append(e_prot)
+        if self.contrastive_lig and e_lig is not None:
+            parts.append(e_lig)
+        if self.proj_target is None or not parts:
+            return torch.zeros((), device=p.device)
+        t = F.normalize(self.proj_target(torch.cat(parts, dim=1)), dim=1)
+        sim = p @ t.T / self.tau
+        labels = torch.arange(len(p), device=p.device)
+        return F.cross_entropy(sim, labels)
+
+    # ----------------------------------------------------------------- #
+    # CLI e otimizador
+    # ----------------------------------------------------------------- #
     @staticmethod
     def add_specific_args(parent_parser):
         """Add model specific arguments to the parser; accessible with self.hparams."""
@@ -310,8 +441,10 @@ class Baseline(pl.LightningModule):
         # parser.add_argument("--kernel-sizes", type=int, nargs="+", default=[3], help="Kernel size in each conv layer.")
         parser.add_argument("--depthwise-convs", action="store_true", help="Use depthwise separable convolutions.")
         parser.add_argument("--adaptive-pooling", action="store_true", help="Use adaptive pooling before flattening.")
-        parser.add_argument("--f-dim", type=int, default=512, help="Dimension of the compact latent f.")
-        parser.add_argument("--emb-proj-dim", type=int, default=128, help="Dimension of embedding conditioning projections.")
+        parser.add_argument("--latent-dim", type=int, default=512, help="Width of the shared latent z, applied after the branch concatenation. 0 disables the bottleneck: the head reads the concatenation directly, which with no embeddings reproduces the upstream docktdeep architecture.")
+        parser.add_argument("--emb-proj-dim", type=int, default=128, help="Default width of the embedding conditioning projections, used by any branch that does not override it.")
+        parser.add_argument("--emb-proj-dim-prot", type=int, default=-1, help="Width of the ESM-2 projection before the concatenation. 0 removes the projection and feeds the frozen embedding raw into u (no BatchNorm, so it arrives on a different scale than the CNN output). -1 follows --emb-proj-dim.")
+        parser.add_argument("--emb-proj-dim-lig", type=int, default=-1, help="Width of the ChemBERTa projection before the concatenation. 0 removes the projection and feeds the frozen embedding raw into u. -1 follows --emb-proj-dim.")
         parser.add_argument("--semi", action="store_true", default=False, help="Enable factor C: semi-supervised + regularizers.")
         parser.add_argument("--no-cnn", action="store_true", default=False, help="Ablate the 3D CNN branch: predict from the frozen embeddings alone (requires --use-esm2 and/or --use-chemberta).")
         parser.add_argument("--preds-dir", type=str, default="preds", help="Directory for the per-complex test predictions CSV (id,y_true,y_pred).")
@@ -356,228 +489,9 @@ class Baseline(pl.LightningModule):
             eps=self.hparams.eps,
             weight_decay=self.hparams.wdecay,
         )
-
-    def _ifp_sim(self, ifp):
-        """Pairwise Dice similarity of binary interaction fingerprints (B, 4096) -> (B, B)."""
-        b = ifp.float()
-        inter = b @ b.T  # (B, B) shared bits
-        pop = b.sum(dim=1)  # (B,)
-        return 2.0 * inter / (pop[:, None] + pop[None, :] + 1e-8)
-
-    def _voxel_sim(self, x):
-        """On-the-fly structural similarity from the input voxel grids (10.5).
-
-        Coarse per-sample 3D-occupancy descriptor via adaptive average pooling to
-        (4,4,4); pairwise cosine similarity. Cheap and does not depend on the
-        precomputed IFP (the pre-IFP alternative of section 10.5).
-        """
-        B = x.shape[0]
-        desc = F.adaptive_avg_pool3d(x, (4, 4, 4))  # (B, C, 4, 4, 4)
-        desc = desc.reshape(B, -1)  # (B, C*64)
-        desc = F.normalize(desc, dim=1)
-        return desc @ desc.T  # (B, B)
-
-    def _sim_infonce(self, p, tgt):
-        """InfoNCE against a fixed soft target (factor C decomposition).
-
-        ``tgt`` is row-normalized; rows with no positive partner (rowsum ~ 0)
-        stay at zero and contribute no gradient, so the loss only shapes ranking
-        *within* each sample's selected context.
-        """
-        sim = p @ p.T / self.tau  # (B, B) embedding similarity
-        # The target is a fixed weighting (labels / IFP / similarity) — detach so
-        # gradient only flows through the projection similarity sim(p,p), never
-        # through the raw inputs.
-        tgt = tgt.detach()
-        rowsum = tgt.sum(dim=1, keepdim=True)
-        tgt = torch.where(rowsum > 1e-8, tgt / (rowsum + 1e-8), torch.zeros_like(tgt))
-        log_softmax = torch.log_softmax(sim, dim=1)
-        return -(tgt * log_softmax).sum(dim=1).mean()
-
-    def _yaware_infonce(self, p, y, ifp=None, x=None, e_prot=None, e_lig=None, reg_loss=None):
-        """Soft InfoNCE anchored on affinity, IFP, structure, or embedding similarities.
-
-        Shapes p(f) so that projection-space proximity mirrors target similarity ordering.
-        """
-        B = p.shape[0]
-        eye = torch.eye(B, device=p.device)
-        d = torch.abs(y[:, None] - y[None, :])  # (B, B) affinity distance
-        aff = torch.exp(-d / self.yaware_sigma) * (1.0 - eye)
-        needs_ifp = self.anchor_mode in ("gate", "ifp", "hybrid", "dual")
-
-        if needs_ifp and ifp is not None:
-            ifp_sim = self._ifp_sim(ifp) * (1.0 - eye)
-        if self.anchor_mode == "dual" and ifp is not None:
-            l_aff = self._sim_infonce(p, aff)
-            l_ifp = self._sim_infonce(p, ifp_sim)
-            if self.auto_scale_loss and reg_loss is not None:
-                reg_scale = reg_loss.detach() + 1e-8
-                l_aff_s = l_aff * (reg_scale / (l_aff.detach() + 1e-8))
-                l_ifp_s = l_ifp * (reg_scale / (l_ifp.detach() + 1e-8))
-            elif self.auto_scale_loss:
-                l_aff_s = l_aff / (l_aff.detach() + 1e-8)
-                l_ifp_s = l_ifp / (l_ifp.detach() + 1e-8)
-            else:
-                l_aff_s, l_ifp_s = l_aff, l_ifp
-            base_loss = self.lambda_aff * l_aff_s + self.lambda_ifp * l_ifp_s
-        elif self.anchor_mode == "affinity" or (needs_ifp and ifp is None):
-            tgt = aff
-            base_loss = self._sim_infonce(p, tgt)
-        elif self.anchor_mode == "gate":
-            gate = (self._ifp_sim(ifp) >= self.ifp_tau).float() * (1.0 - eye)
-            tgt = aff * gate
-            base_loss = self._sim_infonce(p, tgt)
-        elif self.anchor_mode == "ifp":
-            tgt = ifp_sim
-            base_loss = self._sim_infonce(p, tgt)
-        elif self.anchor_mode == "hybrid":
-            tgt = aff * ifp_sim
-            base_loss = self._sim_infonce(p, tgt)
-        elif self.anchor_mode == "struct":
-            vsim = self._voxel_sim(x) * (1.0 - eye) if x is not None else None
-            tgt = aff * vsim if vsim is not None else aff
-            base_loss = self._sim_infonce(p, tgt)
-        else:
-            raise ValueError(f"unknown anchor_mode: {self.anchor_mode}")
-
-        total_loss = base_loss
-
-        # Optional ESM-2 protein embedding cosine similarity term
-        if self.lambda_prot > 0.0 and e_prot is not None:
-            e_prot_norm = F.normalize(e_prot, dim=1)
-            tgt_prot = torch.relu(e_prot_norm @ e_prot_norm.T) * (1.0 - eye)
-            l_prot = self._sim_infonce(p, tgt_prot)
-            if self.auto_scale_loss and reg_loss is not None:
-                reg_scale = reg_loss.detach() + 1e-8
-                l_prot_s = l_prot * (reg_scale / (l_prot.detach() + 1e-8))
-            elif self.auto_scale_loss:
-                l_prot_s = l_prot / (l_prot.detach() + 1e-8)
-            else:
-                l_prot_s = l_prot
-            total_loss = total_loss + self.lambda_prot * l_prot_s
-
-        # Optional ChemBERTa ligand embedding cosine similarity term
-        if self.lambda_lig > 0.0 and e_lig is not None:
-            e_lig_norm = F.normalize(e_lig, dim=1)
-            tgt_lig = torch.relu(e_lig_norm @ e_lig_norm.T) * (1.0 - eye)
-            l_lig = self._sim_infonce(p, tgt_lig)
-            if self.auto_scale_loss and reg_loss is not None:
-                reg_scale = reg_loss.detach() + 1e-8
-                l_lig_s = l_lig * (reg_scale / (l_lig.detach() + 1e-8))
-            elif self.auto_scale_loss:
-                l_lig_s = l_lig / (l_lig.detach() + 1e-8)
-            else:
-                l_lig_s = l_lig
-            total_loss = total_loss + self.lambda_lig * l_lig_s
-
-        return total_loss
-
-    # --- target builders for the similarity-term decomposition (factor C) ----
-    def _aff_target(self, y):
-        """Soft-positive target from affinity proximity: exp(-|dy| / sigma), off-diagonal."""
-        B = y.shape[0]
-        d = torch.abs(y[:, None] - y[None, :])
-        return torch.exp(-d / self.yaware_sigma) * (1.0 - torch.eye(B, device=y.device))
-
-    def _ifp_target(self, ifp):
-        """Soft-positive target from PLEC IFP Dice, off-diagonal."""
-        B = ifp.shape[0]
-        return self._ifp_sim(ifp) * (1.0 - torch.eye(B, device=ifp.device))
-
-    def _prot_target(self, prot_idx):
-        """Soft-positive target from precomputed PSI (S_prot), off-diagonal.
-
-        Only the (B, B) sub-block is gathered on CPU and moved to the device; the
-        full matrix stays a numpy array. Values are PSI/100 in [0, 1]; the all-zero
-        sentinel row yields a zero target row (no gradient).
-        """
-        pidx = prot_idx.detach().cpu().numpy()
-        sub = self.S_prot[np.ix_(pidx, pidx)].astype(np.float32) / 100.0
-        tgt = torch.as_tensor(sub, device=prot_idx.device)
-        return tgt * (1.0 - torch.eye(pidx.shape[0], device=prot_idx.device))
-
-    def _lig_target(self, lig_idx):
-        """Soft-positive target from precomputed Morgan Tanimoto (S_lig), off-diagonal."""
-        lidx = lig_idx.detach().cpu().numpy()
-        sub = self.S_lig[np.ix_(lidx, lidx)].astype(np.float32) / 100.0
-        tgt = torch.as_tensor(sub, device=lig_idx.device)
-        return tgt * (1.0 - torch.eye(lidx.shape[0], device=lig_idx.device))
-
-    def _sim_terms_loss(self, p, prot_idx, lig_idx, ifp, y):
-        """Weighted sum of the active similarity terms over the shared projection p.
-
-        Returns ``(weighted_total, per_term)`` where ``per_term[k] = (L_k, row_frac)``
-        with ``L_k`` the unweighted loss and ``row_frac`` the fraction of batch rows
-        that have at least one positive partner for that term.
-        """
-        total = torch.zeros((), device=p.device)
-        per_term = {}
-        for k in self.sim_terms:
-            if k == "ifp":
-                tgt = self._ifp_target(ifp)
-            elif k == "aff":
-                tgt = self._aff_target(y)
-            elif k == "prot":
-                tgt = self._prot_target(prot_idx)
-            elif k == "lig":
-                tgt = self._lig_target(lig_idx)
-            else:
-                raise ValueError(f"unknown sim term: {k}")
-            row_frac = (tgt.sum(dim=1) > 1e-8).float().mean()
-            Lk = self._sim_infonce(p, tgt)
-            per_term[k] = (Lk, row_frac)
-            total = total + Lk
-        return self.sim_lambda * total, per_term
-
-    def _semi_loss(self, x, e_prot, e_lig, y, ifp=None, prot_idx=None, lig_idx=None, reg_loss=None):
-        """L_semi (factor C): consistency (R-Drop) + contrastive (y-aware or embedding-anchored).
-
-        With --sim-terms active it returns ``(rdrop, sim_block)``; otherwise a
-        scalar ``rdrop [+ contrastive]`` (legacy paths untouched).
-        """
-        self.train()  # enable dropout for stochastic passes
-        p1 = F.normalize(self.proj_head(self.forward_base_f(x, e_prot, e_lig)), dim=1)
-        p2 = F.normalize(self.proj_head(self.forward_base_f(x, e_prot, e_lig)), dim=1)
-        rdrop = F.mse_loss(p1, p2)  # consistency: align p(f) under two stochastic passes
-
-        if self.sim_terms:
-            return rdrop, self._sim_terms_loss(p1, prot_idx, lig_idx, ifp, y)
-
-        loss = rdrop
-        if self.yaware:
-            loss = loss + self._yaware_infonce(p1, y, ifp, x=x, e_prot=e_prot, e_lig=e_lig, reg_loss=reg_loss)
-            return loss
-
-        parts = []
-        if self.proj_prot is not None and e_prot is not None:
-            parts.append(e_prot)
-        if self.proj_lig is not None and e_lig is not None:
-            parts.append(e_lig)
-        if self.proj_target is not None and parts:
-            t = F.normalize(self.proj_target(torch.cat(parts, dim=1)), dim=1)
-            sim = p1 @ t.T / self.tau
-            labels = torch.arange(len(p1), device=p1.device)
-            loss = loss + F.cross_entropy(sim, labels)  # InfoNCE anchoring p(f) to (e_prot,e_lig)
-        return loss
-
-    def forward_base_f(self, x, e_prot=None, e_lig=None):
-        """Forward up to the base latent f (before embedding conditioning)."""
-        if e_prot is not None and isinstance(e_prot, torch.Tensor) and e_prot.device != self.device:
-            e_prot = e_prot.to(self.device)
-        if e_lig is not None and isinstance(e_lig, torch.Tensor) and e_lig.device != self.device:
-            e_lig = e_lig.to(self.device)
-        if self.no_cnn:
-            parts = []
-            if self.proj_prot is not None and e_prot is not None:
-                parts.append(self.proj_prot(e_prot))
-            if self.proj_lig is not None and e_lig is not None:
-                parts.append(self.proj_lig(e_lig))
-            f = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
-        else:
-            f = self.f_proj(self.flatten(self.conv_layers(x)))
-        self.last_f = f
-        return f
-
+    # ----------------------------------------------------------------- #
+    # laco de treino, metricas e dump
+    # ----------------------------------------------------------------- #
     def shared_step(self, batch, batch_idx, stage):
         if len(batch) == 7:
             # similarity-term ablation: (voxs, e_prot, e_lig, ifp, prot_idx, lig_idx, y)
@@ -681,10 +595,11 @@ class Baseline(pl.LightningModule):
             if len(val_strata) == preds.numel():
                 for st in np.unique(val_strata):
                     mask = (val_strata == st)
-                    if mask.sum() >= 2:
+                    if mask.sum() >= MIN_STRATUM_N:
                         sub_p = preds[mask]
                         sub_l = labels[mask]
                         sub_m = self._regression_metrics(sub_p, sub_l, f"val_{st}")
+                        sub_m[f"val_{st}_n"] = float(mask.sum())
                         log.update(sub_m)
 
         if bool(self.hparams.get("eval_test_per_epoch", False)) and dm is not None and hasattr(dm, "test_dataloader"):
@@ -710,10 +625,11 @@ class Baseline(pl.LightningModule):
                     if len(test_strata) == t_preds.numel():
                         for st in np.unique(test_strata):
                             mask = (test_strata == st)
-                            if mask.sum() >= 2:
+                            if mask.sum() >= MIN_STRATUM_N:
                                 sub_p = t_preds[mask]
                                 sub_l = t_labels[mask]
                                 sub_m = self._regression_metrics(sub_p, sub_l, f"test_{st}")
+                                sub_m[f"test_{st}_n"] = float(mask.sum())
                                 log.update(sub_m)
             # sem isto o modelo seguiria em eval() no resto do treino (dropout
             # e batchnorm desligados) — fatal numa busca que tuna dropout
@@ -733,7 +649,8 @@ class Baseline(pl.LightningModule):
             {
                 "best_val_pearsonr": best_pearsonr["val_pearsonr"],
                 "best_val_loss": best_loss["val_loss"],
-                "best_val_mae": best_loss["val_mae"],
+                "best_val_mae": best_mae["val_mae"],
+                "val_mae_at_best_loss": best_loss["val_mae"],
             },
             context={"subset": "val"},
         )
@@ -769,10 +686,6 @@ class Baseline(pl.LightningModule):
             f"{stage}_mae": self.mae(preds, labels),
             f"{stage}_mse": mse,
             f"{stage}_rmse": torch.sqrt(mse),
-            # MAPE/sMAPE dividem por |y|, que nao tem significado em pKi (grandeza
-            # intervalar); o epsilon do torchmetrics (1.17e-6) so evita o ZeroDivision.
-            f"{stage}_mape": mean_absolute_percentage_error(preds, labels),
-            f"{stage}_smape": symmetric_mean_absolute_percentage_error(preds, labels),
             f"{stage}_r2": r2_score(preds, labels),
             f"{stage}_spearman": spearman_corrcoef(preds, labels),
         }
