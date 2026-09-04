@@ -1,9 +1,10 @@
 """Cabecas do modelo: a de regressao (afinidade) e a de projecao (fator C).
 
-As duas consomem o mesmo latente, mas em pontos diferentes: a de regressao ve
-`f` ja concatenado com as projecoes dos embeddings, a de projecao ve apenas o
-`f` base — e por isso que os termos contrastivos nao alcancam `proj_prot` e
-`proj_lig` quando a CNN esta ligada.
+As duas leem o MESMO latente `z`, ja depois da concatenacao dos ramos (ver
+`latent.py`). E o que faz o gradiente dos termos contrastivos atravessar o
+concat e alcancar `proj_prot`/`proj_lig`: com o gargalo aplicado antes do
+concat, como era ate aqui, a cabeca de projecao via so o ramo convolucional e
+as projecoes dos embeddings eram treinadas apenas pela perda de regressao.
 """
 
 import torch

@@ -187,6 +187,16 @@ class Baseline(pl.LightningModule):
             self.loss_fn = torch.nn.MSELoss()
         self.label_smoothing = float(hp.get("label_smoothing", 0.0))
         self.lambda_semi = float(hp.get("lambda_semi", 1.0))
+        # Peso proprio do R-Drop. None mantem o acoplamento historico (a
+        # consistencia e escalada junto com o bloco contrastivo por
+        # --lambda-semi); um valor explicito a separa, e 0.0 a desliga sem
+        # mexer nos termos contrastivos.
+        lam_rdrop = hp.get("lambda_rdrop", None)
+        self.lambda_rdrop = None if lam_rdrop is None else float(lam_rdrop)
+        # Ruido no latente `z`, aplicado so nas passagens contrastivas: e o que
+        # faz a consistencia do R-Drop restringir a representacao, e nao apenas
+        # as mascaras internas do proj_head.
+        self.rdrop_dropout = float(hp.get("rdrop_dropout", 0.0))
         self.tau = float(hp.get("semi_tau", 0.1))
         self.yaware = bool(hp.get("yaware", False))
         self.yaware_sigma = float(hp.get("yaware_sigma", 1.0))
@@ -222,6 +232,11 @@ class Baseline(pl.LightningModule):
             self._validate_sim_terms()
             self._load_sim_matrices()
 
+    @property
+    def rdrop_weight(self) -> float:
+        """Peso que de fato multiplica o R-Drop na loss total."""
+        return self.lambda_semi if self.lambda_rdrop is None else self.lambda_rdrop
+
     def _validate_sim_terms(self) -> None:
         """Recusa combinacoes que produziriam um termo morto ou dominante."""
         if self.sim_kendall:
@@ -242,13 +257,14 @@ class Baseline(pl.LightningModule):
             raise ValueError(
                 "--sim-terms ifp requires --ifp-path: without it every ifp slot is None and "
                 "L_ifp would be identically zero (a dead term) while the run looks healthy.")
-        # non-dominance budget: lambda_semi (RDrop) + one lambda per term must
+        # non-dominance budget: the R-Drop weight + one lambda per term must
         # stay within the total block (D5: 5 x 0.025 = 0.125).
-        total = self.lambda_semi + len(self.sim_terms) * self.sim_lambda
+        total = self.rdrop_weight + len(self.sim_terms) * self.sim_lambda
         if total > self.sim_lambda_max + 1e-9:
             raise ValueError(
-                f"similarity budget {total:.3f} (lambda_semi + |K|*sim_lambda) exceeds "
-                f"--sim-lambda-max {self.sim_lambda_max}; lower --sim-lambda or --lambda-semi.")
+                f"similarity budget {total:.3f} (rdrop_weight + |K|*sim_lambda) exceeds "
+                f"--sim-lambda-max {self.sim_lambda_max}; lower --sim-lambda, --lambda-semi "
+                f"or --lambda-rdrop.")
 
     def _load_sim_matrices(self):
         """Load the precomputed similarity matrices as plain numpy arrays.
@@ -381,22 +397,44 @@ class Baseline(pl.LightningModule):
                    reg_loss=None):
         """L_semi (factor C): consistency (R-Drop) + contrastive (y-aware or embedding-anchored).
 
-        With --sim-terms active it returns ``(rdrop, sim_block)``; otherwise a
-        scalar ``rdrop [+ contrastive]`` (legacy paths untouched).
+        Devolve SEMPRE ``(rdrop, resto)``: com --sim-terms `resto` e o par
+        ``(sim_block, per_term)``, nos demais casos e o escalar contrastivo.
+        Separar os dois e o que permite pesar a consistencia sozinha
+        (--lambda-rdrop); quem recompoe a soma e o `shared_step`.
         """
         self.train()  # enable dropout for stochastic passes
-        p1 = F.normalize(self.proj_head(self.forward_latent(x, e_prot, e_lig)), dim=1)
-        p2 = F.normalize(self.proj_head(self.forward_latent(x, e_prot, e_lig)), dim=1)
-        rdrop = F.mse_loss(p1, p2)  # consistency: align p(f) under two stochastic passes
+        z1 = self.forward_latent(x, e_prot, e_lig)
+        z2 = self.forward_latent(x, e_prot, e_lig)
+
+        if self.rdrop_dropout > 0.0:
+            # As duas vistas passam a diferir ja em `z`, entao a consistencia
+            # restringe a representacao e nao so o dropout interno do
+            # proj_head. Fica aqui, e nao em `forward_latent`, porque vale so
+            # para as passagens contrastivas: a de predicao (L_reg) continua
+            # deterministica.
+            pa = F.normalize(
+                self.proj_head(F.dropout(z1, self.rdrop_dropout, True)), dim=1)
+            pb = F.normalize(
+                self.proj_head(F.dropout(z2, self.rdrop_dropout, True)), dim=1)
+            # Os termos contrastivos leem uma projecao LIMPA, para que
+            # --rdrop-dropout continue sendo um eixo que mexe apenas no R-Drop.
+            # Reusa `z1`: e mais uma passada pelo proj_head, nao pela CNN.
+            p = F.normalize(self.proj_head(z1), dim=1)
+        else:
+            pa = F.normalize(self.proj_head(z1), dim=1)
+            pb = F.normalize(self.proj_head(z2), dim=1)
+            p = pa
+
+        rdrop = F.mse_loss(pa, pb)  # consistency between the two stochastic views
 
         if self.sim_terms:
-            return rdrop, self._sim_terms_loss(p1, prot_idx, lig_idx, ifp, y)
+            return rdrop, self._sim_terms_loss(p, prot_idx, lig_idx, ifp, y)
 
         if self.yaware:
-            return rdrop + self._yaware_infonce(
-                p1, y, ifp, x=x, e_prot=e_prot, e_lig=e_lig, reg_loss=reg_loss)
+            return rdrop, self._yaware_infonce(
+                p, y, ifp, x=x, e_prot=e_prot, e_lig=e_lig, reg_loss=reg_loss)
 
-        return rdrop + self._embedding_anchored_loss(p1, e_prot, e_lig)
+        return rdrop, self._embedding_anchored_loss(p, e_prot, e_lig)
 
     def _embedding_anchored_loss(self, p, e_prot, e_lig):
         """InfoNCE que ancora p(f) no par (e_prot, e_lig) do proprio complexo.
@@ -454,6 +492,8 @@ class Baseline(pl.LightningModule):
         parser.add_argument("--lambda-semi", type=float, default=1.0, help="Weight of L_semi in the total loss.")
         parser.add_argument("--proj-dim", type=int, default=128, help="Projection head p(f) output dim (factor C).")
         parser.add_argument("--semi-tau", type=float, default=0.1, help="Temperature for contrastive L_semi.")
+        parser.add_argument("--lambda-rdrop", type=float, default=None, help="Weight of the R-Drop consistency term ALONE. Unset (default) keeps the historical coupling: R-Drop is scaled by --lambda-semi together with the contrastive block, so every run measured so far is reproduced bit for bit. Set it to weight the consistency independently; 0 disables R-Drop while keeping the contrastive terms, which is what isolates its individual contribution.")
+        parser.add_argument("--rdrop-dropout", type=float, default=0.0, help="Dropout applied to the latent z in the TWO CONTRASTIVE PASSES ONLY, so the R-Drop consistency constrains the representation instead of just the proj_head masks. The prediction pass stays deterministic and L_reg is untouched; the contrastive terms keep reading a clean projection. 0 (default) reproduces the previous behaviour.")
         parser.add_argument("--yaware", action="store_true", default=False, help="Use y-aware InfoNCE (anchored on affinity) instead of embedding-anchored contrastive.")
         parser.add_argument("--yaware-sigma", type=float, default=1.0, help="Affinity distance scale (pKd) for y-aware positive weights.")
         parser.add_argument("--ifp-aware", action="store_true", default=False, help="Alias for --anchor-mode gate (backwards compat with arr09).")
@@ -523,18 +563,26 @@ class Baseline(pl.LightningModule):
             y_target = y_target * (1.0 - self.label_smoothing) + y_target.mean() * self.label_smoothing
         loss = self.loss_fn(y_pred, y_target)
         if self.proj_head is not None and stage == "train":
+            rdrop, rest = self._semi_loss(
+                x, e_prot, e_lig, y, ifp, prot_idx, lig_idx, reg_loss=loss)
             if self.sim_terms:
-                rdrop, (sim_block, per_term) = self._semi_loss(
-                    x, e_prot, e_lig, y, ifp, prot_idx, lig_idx, reg_loss=loss)
-                loss = loss + self.lambda_semi * rdrop + sim_block
+                sim_block, per_term = rest
+                loss = loss + self.rdrop_weight * rdrop + sim_block
                 self.log("train_semi", rdrop.detach(), **log_params)
                 for k, (Lk, row_frac) in per_term.items():
                     self.log(f"train_sim_{k}", Lk.detach(), **log_params)
                     self.log(f"train_sim_{k}_rows", row_frac.detach(), **log_params)
             else:
-                semi = self._semi_loss(x, e_prot, e_lig, y, ifp, reg_loss=loss)
-                loss = loss + self.lambda_semi * semi
+                semi = rdrop + rest
+                # Sem --lambda-rdrop a soma inteira e escalada por lambda_semi,
+                # exatamente como nas campanhas ja rodadas; com ele, cada parte
+                # ganha o seu peso.
+                if self.lambda_rdrop is None:
+                    loss = loss + self.lambda_semi * semi
+                else:
+                    loss = loss + self.lambda_rdrop * rdrop + self.lambda_semi * rest
                 self.log("train_semi", semi.detach(), **log_params)
+            self.log("train_rdrop", rdrop.detach(), **log_params)
         self.log(f"{stage}_loss", loss, **log_params)
 
         # as metricas de treino saem em on_train_epoch_end, sobre a epoca inteira:

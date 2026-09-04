@@ -317,7 +317,9 @@ def test_ce_branch_equivalence():
     # _semi_loss does two stochastic passes (proj_head dropout); reseed before
     # each call so new and old consume identical dropout masks.
     torch.manual_seed(123)
-    new = model._semi_loss(None, e_prot, None, y)
+    # _semi_loss agora devolve (rdrop, resto); a soma e o antigo escalar.
+    rdrop_new, contrast_new = model._semi_loss(None, e_prot, None, y)
+    new = rdrop_new + contrast_new
     torch.manual_seed(123)
     old = manual_ce()
     check("_semi_loss CE branch new==old", abs(new.item() - old.item()) < 1e-6,
