@@ -9,7 +9,7 @@ as projecoes dos embeddings eram treinadas apenas pela perda de regressao.
 
 import torch
 
-__all__ = ["build_regression_head", "build_projection_head", "FCGroup"]
+__all__ = ["build_regression_head", "build_projection_head"]
 
 
 def build_regression_head(
@@ -35,35 +35,22 @@ def build_regression_head(
     return torch.nn.Sequential(*layers)
 
 
-def build_projection_head(in_dim: int, proj_dim: int) -> torch.nn.Sequential:
-    """p(f) para o objetivo semi-supervisionado.
+def build_projection_head(
+    in_dim: int, proj_dim: int, dropout: float = 0.1
+) -> torch.nn.Sequential:
+    """p(z) para o objetivo semi-supervisionado.
 
-    O `Dropout` no meio nao e regularizacao: e a fonte de estocasticidade que a
-    consistencia R-Drop compara entre duas passadas do mesmo exemplo.
+    O `Dropout` no meio nao e regularizacao: e a UNICA fonte de estocasticidade
+    que a consistencia R-Drop compara entre as duas projecoes do mesmo exemplo
+    (nao ha dropout algum no caminho ate `z`). Por isso ele governa a magnitude
+    de `L_rdrop`, e por isso virou hiperparametro: com o valor fixo em 0.1,
+    `--lambda-rdrop` e este dropout eram conjuntamente nao-identificaveis —
+    dobrar um e reduzir o outro pela metade dava aproximadamente a mesma perda.
+    O default 0.1 reproduz todas as campanhas anteriores.
     """
     return torch.nn.Sequential(
         torch.nn.Linear(in_dim, proj_dim, bias=False),
         torch.nn.ReLU(inplace=True),
-        torch.nn.Dropout(0.1),
+        torch.nn.Dropout(dropout),
         torch.nn.Linear(proj_dim, proj_dim, bias=False),
     )
-
-
-class FCGroup(torch.nn.Sequential):
-    """Cabeca de regressao do upstream (docktdeep v0.2.0). NAO USADA.
-
-    Era o `fc1` do `Baseline` original (`conv -> flatten -> fc1 -> linear`), ate
-    o condicionamento por embeddings trocar o par `fc1`/`linear` pelo laco de
-    `build_regression_head`. Mantida como registro da linhagem; note o
-    `BatchNorm1d(1000)` fixo, que so nao quebrava porque o default de
-    `--num-fc-units` e `[1000]`. `stn.py` tem a sua propria versao, corrigida e
-    em uso.
-    """
-
-    def __init__(self, in_c, out_c, dropout_rate, **kwargs):
-        super().__init__(
-            torch.nn.Linear(in_c, out_c, bias=False),
-            torch.nn.BatchNorm1d(1000),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Dropout(dropout_rate),
-        )

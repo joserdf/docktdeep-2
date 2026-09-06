@@ -41,6 +41,7 @@ def run(args):
         accelerator=args.accelerator,
         devices=args.devices,
         max_epochs=args.max_epochs,
+        precision=args.precision,
         detect_anomaly=args.detect_anomaly,
         gradient_clip_val=args.gradient_clip_val,
         gradient_clip_algorithm=args.gradient_clip_algorithm,
@@ -242,6 +243,12 @@ def get_parser():
     trainer_parser.add_argument("--detect-anomaly", action="store_true", default=False)
     trainer_parser.add_argument("--gradient-clip-val", type=float, default=5.0)
     trainer_parser.add_argument("--gradient-clip-algorithm", type=str, default="norm")
+    # Default preserva o fp32 de todas as campanhas anteriores; quem quiser
+    # bf16 pede no comando. Separar a capacidade da mudanca de protocolo evita
+    # que o refit em grp_final, ja em submissao, mude de numerica sozinho.
+    # Os tres workers sao RTX 4090 (Ada), entao bf16 e nativo neles.
+    trainer_parser.add_argument("--precision", type=str, default="32-true",
+                                help="Lightning precision. '32-true' is the fp32 of every previous campaign; 'bf16-mixed' roughly halves activation memory (which is what pays for a larger --batch-size) and speeds up the 3D convolutions.")
     trainer_parser.add_argument("--early-stop-patience", type=int, default=50,
                                 help="parar apos N epochs sem melhorar val_pearsonr "
                                      "(0 = desligado; default 50 — RESULTS-MEASURED §21)")

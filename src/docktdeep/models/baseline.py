@@ -1,5 +1,6 @@
 import csv
 import os
+from functools import partial
 
 import numpy as np
 import lightning.pytorch as pl
@@ -53,6 +54,9 @@ class Baseline(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.mae = MeanAbsoluteError()
+        # Norma do gradiente que chega em cada ramo antes do concat, preenchida
+        # por hooks no backward e consumida (e limpa) em `on_after_backward`.
+        self._branch_grad_norm: dict[str, torch.Tensor] = {}
         self.train_step_outputs = []
         self.validation_step_outputs = []
         self.test_step_outputs = []
@@ -158,7 +162,11 @@ class Baseline(pl.LightningModule):
         self.proj_target = None
         if semi:
             proj_dim = int(hp.get("proj_dim", 128))
-            self.proj_head = build_projection_head(self.z_dim, proj_dim)
+            # O dropout do proj_head e a unica fonte de estocasticidade do
+            # R-Drop, entao ele fixa a escala de L_rdrop; ver heads.py.
+            self.proj_head = build_projection_head(
+                self.z_dim, proj_dim, float(hp.get("proj_dropout", 0.1))
+            )
             target_in = (esm2_dim(anchor_esm2) if self.contrastive_prot else 0) + (
                 E_LIG_DIM if self.contrastive_lig else 0
             )
@@ -237,6 +245,18 @@ class Baseline(pl.LightningModule):
         """Peso que de fato multiplica o R-Drop na loss total."""
         return self.lambda_semi if self.lambda_rdrop is None else self.lambda_rdrop
 
+    @property
+    def semi_has_weight(self) -> bool:
+        """True quando o bloco do fator C ainda pode mover algum parametro.
+
+        Com `--lambda-rdrop 0` e `--lambda-semi 0` (ou `--sim-lambda 0`) o
+        bloco inteiro entra na loss multiplicado por zero: as projecoes e os
+        alvos sao calculados, somam nada e o backward passa por eles a toa.
+        Uma configuracao dessas e alcancavel pela busca, entao vale o teste.
+        """
+        contrast_w = self.sim_lambda if self.sim_terms else self.lambda_semi
+        return self.rdrop_weight != 0.0 or contrast_w != 0.0
+
     def _validate_sim_terms(self) -> None:
         """Recusa combinacoes que produziriam um termo morto ou dominante."""
         if self.sim_kendall:
@@ -292,16 +312,39 @@ class Baseline(pl.LightningModule):
 
     def _concat_branches(self, x, e_prot, e_lig):
         """`u`: concatenacao dos ramos ligados, antes do gargalo latente."""
-        parts = []
+        parts, names = [], []
         if not self.no_cnn:
             parts.append(self.flatten(self.conv_layers(x)))
+            names.append("cnn")
         # `proj_* is None` com o ramo ligado significa largura 0: o embedding
         # entra cru, sem projecao.
         if self.use_esm2 and e_prot is not None:
             parts.append(self.proj_prot(e_prot) if self.proj_prot is not None else e_prot)
+            names.append("prot")
         if self.use_chemberta and e_lig is not None:
             parts.append(self.proj_lig(e_lig) if self.proj_lig is not None else e_lig)
-        return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+            names.append("lig")
+        if len(parts) > 1:
+            if self.training:
+                self._watch_branch_grads(names, parts)
+            return torch.cat(parts, dim=1)
+        return parts[0]
+
+    def _watch_branch_grads(self, names, parts) -> None:
+        """Mede quanto gradiente cada ramo recebe, na entrada do concat.
+
+        Responde "o ramo esta morto?" DENTRO de cada run. Com a CNN despejando
+        ~6912 dims em `u` contra os 128 default de cada embedding, "B nao
+        ajudou" e "B ajudaria mas esta afogado" sao indistinguiveis olhando so
+        as medias de celula da grade. So faz sentido com mais de um ramo, e um
+        embedding cru (largura 0) nao tem gradiente para medir.
+        """
+        for name, t in zip(names, parts):
+            if t.requires_grad:
+                t.register_hook(partial(self._record_branch_grad, name))
+
+    def _record_branch_grad(self, name, grad) -> None:
+        self._branch_grad_norm[name] = grad.detach().norm()
 
     def forward_latent(self, x, e_prot=None, e_lig=None):
         """Forward ate `z`, o espaco latente que alimenta as duas cabecas.
@@ -312,9 +355,7 @@ class Baseline(pl.LightningModule):
         """
         e_prot, e_lig = self._to_device(e_prot, e_lig)
         u = self._concat_branches(x, e_prot, e_lig)
-        z = self.latent_proj(u) if self.latent_proj is not None else u
-        self.last_z = z
-        return z
+        return self.latent_proj(u) if self.latent_proj is not None else u
 
     def forward(self, x, e_prot=None, e_lig=None):
         return self.head(self.forward_latent(x, e_prot, e_lig))
@@ -362,10 +403,10 @@ class Baseline(pl.LightningModule):
         return losses.precomputed_target(lig_idx, self.S_lig)
 
     def _yaware_infonce(self, p, y, ifp=None, x=None, e_prot=None, e_lig=None,
-                        reg_loss=None):
+                        reg_loss=None, diag=None):
         return losses.yaware_infonce(
             p, y, self._contrastive_cfg(), ifp=ifp, x=x,
-            e_prot=e_prot, e_lig=e_lig, reg_loss=reg_loss,
+            e_prot=e_prot, e_lig=e_lig, reg_loss=reg_loss, diag=diag,
         )
 
     def _similarity_targets(self, prot_idx, lig_idx, ifp, y) -> dict:
@@ -393,36 +434,48 @@ class Baseline(pl.LightningModule):
         targets = self._similarity_targets(prot_idx, lig_idx, ifp, y)
         return losses.similarity_terms_loss(p, targets, self.tau, self.sim_lambda)
 
-    def _semi_loss(self, x, e_prot, e_lig, y, ifp=None, prot_idx=None, lig_idx=None,
-                   reg_loss=None):
+    def _semi_loss(self, z, x, e_prot, e_lig, y, ifp=None, prot_idx=None,
+                   lig_idx=None, reg_loss=None, diag=None):
         """L_semi (factor C): consistency (R-Drop) + contrastive (y-aware or embedding-anchored).
+
+        Recebe o `z` JA CALCULADO pela passada de predicao. Antes este metodo
+        chamava `forward_latent` mais duas vezes, e as tres passadas eram
+        redundantes: nao ha dropout nenhum no caminho ate `z` (nem em `cnn.py`
+        nem em `blocks.py`), entao os tres tensores eram identicos bit a bit. O
+        que as passadas extras de fato mudavam era o numero de atualizacoes das
+        estatisticas das BatchNorm — tres por passo com o fator C ligado contra
+        uma sem ele —, o que fazia toda comparacao C-on x C-off carregar junto
+        um regime de normalizacao diferente na avaliacao. Uma passada so remove
+        o confundimento e ~54% do wall-clock medido nas runs C-on.
+
+        A estocasticidade do R-Drop nao vem das passadas: vem do `Dropout` do
+        `proj_head`, que sorteia uma mascara nova a cada chamada. Duas chamadas
+        sobre o MESMO `z` dao exatamente a mesma distribuicao de antes.
 
         Devolve SEMPRE ``(rdrop, resto)``: com --sim-terms `resto` e o par
         ``(sim_block, per_term)``, nos demais casos e o escalar contrastivo.
         Separar os dois e o que permite pesar a consistencia sozinha
         (--lambda-rdrop); quem recompoe a soma e o `shared_step`.
         """
-        self.train()  # enable dropout for stochastic passes
-        z1 = self.forward_latent(x, e_prot, e_lig)
-        z2 = self.forward_latent(x, e_prot, e_lig)
+        self.train()  # garante o dropout do proj_head ligado nas projecoes
 
         if self.rdrop_dropout > 0.0:
             # As duas vistas passam a diferir ja em `z`, entao a consistencia
             # restringe a representacao e nao so o dropout interno do
             # proj_head. Fica aqui, e nao em `forward_latent`, porque vale so
-            # para as passagens contrastivas: a de predicao (L_reg) continua
-            # deterministica.
+            # para as projecoes contrastivas: a predicao (L_reg) le o `z`
+            # deterministico.
             pa = F.normalize(
-                self.proj_head(F.dropout(z1, self.rdrop_dropout, True)), dim=1)
+                self.proj_head(F.dropout(z, self.rdrop_dropout, True)), dim=1)
             pb = F.normalize(
-                self.proj_head(F.dropout(z2, self.rdrop_dropout, True)), dim=1)
-            # Os termos contrastivos leem uma projecao LIMPA, para que
-            # --rdrop-dropout continue sendo um eixo que mexe apenas no R-Drop.
-            # Reusa `z1`: e mais uma passada pelo proj_head, nao pela CNN.
-            p = F.normalize(self.proj_head(z1), dim=1)
+                self.proj_head(F.dropout(z, self.rdrop_dropout, True)), dim=1)
+            # Os termos contrastivos leem uma projecao livre do ruido NOVO (o
+            # dropout interno do proj_head continua valendo), para que
+            # --rdrop-dropout siga sendo um eixo que mexe apenas no R-Drop.
+            p = F.normalize(self.proj_head(z), dim=1)
         else:
-            pa = F.normalize(self.proj_head(z1), dim=1)
-            pb = F.normalize(self.proj_head(z2), dim=1)
+            pa = F.normalize(self.proj_head(z), dim=1)
+            pb = F.normalize(self.proj_head(z), dim=1)
             p = pa
 
         rdrop = F.mse_loss(pa, pb)  # consistency between the two stochastic views
@@ -432,7 +485,8 @@ class Baseline(pl.LightningModule):
 
         if self.yaware:
             return rdrop, self._yaware_infonce(
-                p, y, ifp, x=x, e_prot=e_prot, e_lig=e_lig, reg_loss=reg_loss)
+                p, y, ifp, x=x, e_prot=e_prot, e_lig=e_lig, reg_loss=reg_loss,
+                diag=diag)
 
         return rdrop, self._embedding_anchored_loss(p, e_prot, e_lig)
 
@@ -472,6 +526,9 @@ class Baseline(pl.LightningModule):
         parser.add_argument("--eps", type=float, default=1e-8)
         parser.add_argument("--dropout", type=float, default=0.0)
         parser.add_argument("--wdecay", type=float, default=0.0)
+        parser.add_argument("--lr-scheduler", type=str, default="none",
+                            choices=["none", "cosine", "plateau"],
+                            help="LR schedule. 'none' keeps the constant LR of every previous campaign. 'cosine' anneals over --max-epochs down to lr/100. 'plateau' halves-ish (factor 0.3) on val_pearsonr stalls, patience 8. Searched as an axis: the level 'none' is what keeps old runs comparable.")
         parser.add_argument("--num-fc-units", type=int, nargs="+", default=[1000], help="Number of neurons in each fc layer")
         # parser.add_argument("--num-fc-layers", type=int, default=1, help="Number of fc layers (not useful if `--fc-layers` is already specified; can be used to specify the number of fc layers in a hyperparameter search).")
         # parser.add_argument("--num-conv-layers", type=int, default=1, help="Number of conv layers.")
@@ -490,7 +547,8 @@ class Baseline(pl.LightningModule):
         parser.add_argument("--huber-beta", type=float, default=1.0, help="Huber loss beta (if --loss huber).")
         parser.add_argument("--label-smoothing", type=float, default=0.0, help="Shrink regression targets toward batch mean.")
         parser.add_argument("--lambda-semi", type=float, default=1.0, help="Weight of L_semi in the total loss.")
-        parser.add_argument("--proj-dim", type=int, default=128, help="Projection head p(f) output dim (factor C).")
+        parser.add_argument("--proj-dim", type=int, default=128, help="Projection head p(z) output dim (factor C).")
+        parser.add_argument("--proj-dropout", type=float, default=0.1, help="Dropout inside the projection head. It is the ONLY source of stochasticity the R-Drop consistency compares (there is no dropout on the path to z), so it sets the magnitude of L_rdrop: leaving it fixed makes it and --lambda-rdrop jointly unidentifiable. Default 0.1 reproduces every campaign run so far.")
         parser.add_argument("--semi-tau", type=float, default=0.1, help="Temperature for contrastive L_semi.")
         parser.add_argument("--lambda-rdrop", type=float, default=None, help="Weight of the R-Drop consistency term ALONE. Unset (default) keeps the historical coupling: R-Drop is scaled by --lambda-semi together with the contrastive block, so every run measured so far is reproduced bit for bit. Set it to weight the consistency independently; 0 disables R-Drop while keeping the contrastive terms, which is what isolates its individual contribution.")
         parser.add_argument("--rdrop-dropout", type=float, default=0.0, help="Dropout applied to the latent z in the TWO CONTRASTIVE PASSES ONLY, so the R-Drop consistency constrains the representation instead of just the proj_head masks. The prediction pass stays deterministic and L_reg is untouched; the contrastive terms keep reading a clean projection. 0 (default) reproduces the previous behaviour.")
@@ -522,13 +580,46 @@ class Baseline(pl.LightningModule):
         return parent_parser
 
     def configure_optimizers(self):
-        return getattr(torch.optim, self.hparams.optim)(
+        opt = getattr(torch.optim, self.hparams.optim)(
             self.parameters(),
             lr=self.hparams.lr,
             betas=(self.hparams.beta1, self.hparams.beta2),
             eps=self.hparams.eps,
             weight_decay=self.hparams.wdecay,
         )
+        # LR constante era o unico regime ate aqui. Medido na campanha 2 (292
+        # runs): o pico de `val_pearsonr` cai na epoca ~19 de 70 treinadas, e
+        # `best_val_pearsonr - final_val_pearsonr` tem mediana +0.046. O modelo
+        # acha o otimo cedo e depois degrada -- a assinatura de LR alto demais
+        # no fim do treino. `none` preserva o comportamento de tudo que ja
+        # rodou, e e o nivel que torna o eixo mensuravel em vez de imposto.
+        sched = str(self.hparams.get("lr_scheduler", "none") or "none")
+        if sched == "none":
+            return opt
+        if sched == "cosine":
+            # T_max = teto de epocas, nao "epocas ate parar": o early stop corta
+            # antes e o cosseno nunca chega ao fim. E de proposito -- amarrar o
+            # horizonte ao ponto de parada tornaria a curva de LR dependente de
+            # quando o trial parou, que e justamente a variavel que a paciencia
+            # controla.
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=int(self.hparams.get("max_epochs", 150)),
+                eta_min=float(self.hparams.lr) * 1e-2,
+            )
+            return {"optimizer": opt, "lr_scheduler": {"scheduler": scheduler,
+                                                       "interval": "epoch"}}
+        if sched == "plateau":
+            # Monitora o MESMO sinal do EarlyStopping, com paciencia menor: o LR
+            # cai algumas vezes antes de o trial ser cortado. Com
+            # --early-stop-patience 25, uma paciencia de 8 permite ~3 reducoes.
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                opt, mode="max", factor=0.3, patience=8,
+            )
+            return {"optimizer": opt,
+                    "lr_scheduler": {"scheduler": scheduler,
+                                     "monitor": "val_pearsonr",
+                                     "interval": "epoch"}}
+        raise ValueError(f"--lr-scheduler desconhecido: {sched!r}")
     # ----------------------------------------------------------------- #
     # laco de treino, metricas e dump
     # ----------------------------------------------------------------- #
@@ -549,7 +640,10 @@ class Baseline(pl.LightningModule):
             e_prot = e_prot.to(self.device)
         if e_lig is not None and isinstance(e_lig, torch.Tensor) and e_lig.device != self.device:
             e_lig = e_lig.to(self.device)
-        y_pred = self(x, e_prot, e_lig)
+        # Uma unica passada ate `z`: a de predicao e a que alimenta tambem as
+        # projecoes do fator C (ver `_semi_loss`).
+        z = self.forward_latent(x, e_prot, e_lig)
+        y_pred = self.head(z)
 
         log_params = {
             "on_step": False,
@@ -562,9 +656,11 @@ class Baseline(pl.LightningModule):
         if self.label_smoothing > 0.0 and stage == "train":
             y_target = y_target * (1.0 - self.label_smoothing) + y_target.mean() * self.label_smoothing
         loss = self.loss_fn(y_pred, y_target)
-        if self.proj_head is not None and stage == "train":
+        if self.proj_head is not None and stage == "train" and self.semi_has_weight:
+            diag: dict = {}
             rdrop, rest = self._semi_loss(
-                x, e_prot, e_lig, y, ifp, prot_idx, lig_idx, reg_loss=loss)
+                z, x, e_prot, e_lig, y, ifp, prot_idx, lig_idx,
+                reg_loss=loss, diag=diag)
             if self.sim_terms:
                 sim_block, per_term = rest
                 loss = loss + self.rdrop_weight * rdrop + sim_block
@@ -583,6 +679,12 @@ class Baseline(pl.LightningModule):
                     loss = loss + self.lambda_rdrop * rdrop + self.lambda_semi * rest
                 self.log("train_semi", semi.detach(), **log_params)
             self.log("train_rdrop", rdrop.detach(), **log_params)
+            # `*_rows` e a fracao de linhas do batch com ao menos um parceiro
+            # positivo naquele termo: e o que separa um termo morto de um zero
+            # saudavel. So o caminho --sim-terms publicava isso; agora o
+            # y-aware tambem (ver losses.row_fraction).
+            for k, v in diag.items():
+                self.log(f"train_yaw_{k}", v, **log_params)
         self.log(f"{stage}_loss", loss, **log_params)
 
         # as metricas de treino saem em on_train_epoch_end, sobre a epoca inteira:
@@ -615,6 +717,20 @@ class Baseline(pl.LightningModule):
         out = self.shared_step(batch, batch_idx, stage="test")
         self.test_step_outputs.append(out)
         return out["test_loss"]
+
+    def on_after_backward(self) -> None:
+        """Publica a norma do gradiente de cada ramo, coletada pelos hooks.
+
+        Aqui, e nao no `shared_step`, porque os hooks so disparam durante o
+        backward. O dicionario e limpo a cada passo para que um ramo que deixe
+        de receber gradiente apareca como ausente, e nao como o ultimo valor.
+        """
+        if not self._branch_grad_norm:
+            return
+        for name, v in self._branch_grad_norm.items():
+            self.log(f"train_grad_{name}", v, on_step=False, on_epoch=True,
+                     logger=True)
+        self._branch_grad_norm.clear()
 
     def on_train_epoch_end(self) -> None:
         out = self.train_step_outputs

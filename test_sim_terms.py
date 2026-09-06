@@ -85,12 +85,17 @@ def synthetic_inputs(model, B=8, D=8):
 
 def test_bounds(model):
     """L_k is guaranteed non-negative; at initialization (uniform logits) it
-    equals log B. NOTE: log B is NOT a hard upper bound for soft targets — it is
-    the loss when all pairwise similarities are equal (uniform log-softmax).
+    equals log(B-1). NOTE: log(B-1) is NOT a hard upper bound for soft targets —
+    it is the loss when all pairwise similarities are equal (uniform
+    log-softmax).
+
+    B-1 and not B since 2026-09-06: `soft_infonce` masks the diagonal out of the
+    softmax denominator, so a row normalizes over its B-1 real negatives instead
+    of over itself plus them. See the docstring there for why.
     """
     p, y, ifp, prot_idx, lig_idx, _ = synthetic_inputs(model)
     B = p.shape[0]
-    logB = np.log(B)
+    logB = np.log(B - 1)
     tgts = {
         "ifp": model._ifp_target(ifp),
         "aff": model._aff_target(y),
@@ -113,8 +118,8 @@ def test_bounds(model):
     p_uniform = F.normalize(torch.ones(B, p.shape[1]), dim=1)
     for k, tgt in t_uniform.items():
         Lk = model._sim_infonce(p_uniform, tgt).item()
-        check(f"init {k}: uniform logits -> L_k == log B", abs(Lk - logB) < 1e-4,
-              f"(L={Lk:.4f}, logB={logB:.4f})")
+        check(f"init {k}: uniform logits -> L_k == log(B-1)", abs(Lk - logB) < 1e-4,
+              f"(L={Lk:.4f}, log(B-1)={logB:.4f})")
 
 
 def test_zero_partner_row(model):
@@ -133,8 +138,9 @@ def test_zero_partner_row(model):
     check("loss non-negative", loss.item() >= 0)
     # per-row contribution of the zero row is exactly 0 (after the same row
     # normalization _sim_infonce applies)
-    sim = p @ p.T / model.tau
-    lsm = torch.log_softmax(sim, dim=1)
+    eye_b = torch.eye(p.shape[0], dtype=torch.bool)
+    sim = (p @ p.T / model.tau).masked_fill(eye_b, float("-inf"))
+    lsm = torch.log_softmax(sim, dim=1).masked_fill(eye_b, 0.0)
     rowsum = tgt.sum(dim=1, keepdim=True)
     tgt_n = torch.where(rowsum > 1e-8, tgt / (rowsum + 1e-8), torch.zeros_like(tgt))
     per_row = -(tgt_n * lsm).sum(dim=1)
@@ -252,8 +258,17 @@ def test_legacy_dispatch_unchanged():
 # 2.5a function-equivalence regression (refactor of _yaware_infonce)
 # --------------------------------------------------------------------------- #
 def old_yaware_infonce(model, p, y, ifp=None, x=None):
+    """Reimplementacao independente do caminho --yaware, usada como referencia.
+
+    ATENCAO: esta funcao acompanha uma mudanca SEMANTICA, nao so um refactor. A
+    mascara da diagonal (2026-09-06) mudou o valor da perda de proposito -- no
+    setup deste teste, de ~8.94 para ~4.72 no anchor=affinity. O objetivo aqui
+    continua sendo o mesmo: guardar a DECOMPOSICAO por anchor_mode contra
+    refatoracoes futuras, nao congelar o numero.
+    """
     B = p.shape[0]
-    sim = p @ p.T / model.tau
+    eye_b = torch.eye(B, dtype=torch.bool, device=p.device)
+    sim = (p @ p.T / model.tau).masked_fill(eye_b, float("-inf"))
     d = torch.abs(y[:, None] - y[None, :])
     eye = torch.eye(B, device=p.device)
     aff = torch.exp(-d / model.yaware_sigma) * (1.0 - eye)
@@ -277,7 +292,7 @@ def old_yaware_infonce(model, p, y, ifp=None, x=None):
     tgt = tgt.detach()
     rowsum = tgt.sum(dim=1, keepdim=True)
     tgt = torch.where(rowsum > 1e-8, tgt / (rowsum + 1e-8), torch.zeros_like(tgt))
-    log_softmax = torch.log_softmax(sim, dim=1)
+    log_softmax = torch.log_softmax(sim, dim=1).masked_fill(eye_b, 0.0)
     return -(tgt * log_softmax).sum(dim=1).mean()
 
 
@@ -307,18 +322,21 @@ def test_ce_branch_equivalence():
     y = torch.rand(B) * 6 + 2
 
     def manual_ce():
-        p1 = F.normalize(model.proj_head(model.forward_latent(None, e_prot, None)), dim=1)
-        p2 = F.normalize(model.proj_head(model.forward_latent(None, e_prot, None)), dim=1)
+        z = model.forward_latent(None, e_prot, None)
+        p1 = F.normalize(model.proj_head(z), dim=1)
+        p2 = F.normalize(model.proj_head(z), dim=1)
         rdrop = F.mse_loss(p1, p2)
         t = F.normalize(model.proj_target(e_prot), dim=1)
         sim = p1 @ t.T / model.tau
         return rdrop + F.cross_entropy(sim, torch.arange(len(p1), device=p1.device))
 
-    # _semi_loss does two stochastic passes (proj_head dropout); reseed before
-    # each call so new and old consume identical dropout masks.
+    # _semi_loss projeta o MESMO z duas vezes (dropout do proj_head); reseed
+    # antes de cada chamada para que new e old consumam as mesmas mascaras.
+    # `forward_latent` nao consome RNG, entao a semente vale para as duas.
     torch.manual_seed(123)
-    # _semi_loss agora devolve (rdrop, resto); a soma e o antigo escalar.
-    rdrop_new, contrast_new = model._semi_loss(None, e_prot, None, y)
+    # _semi_loss agora recebe o z da passada de predicao e devolve (rdrop, resto).
+    z = model.forward_latent(None, e_prot, None)
+    rdrop_new, contrast_new = model._semi_loss(z, None, e_prot, None, y)
     new = rdrop_new + contrast_new
     torch.manual_seed(123)
     old = manual_ce()
