@@ -145,6 +145,29 @@ def emit_metrics_line(trainer, model, args) -> None:
         "val_mae_at_best_loss": float(best_loss["val_mae"]),
         "epochs": trainer.current_epoch,
     }
+    # Estratos da validacao, da MESMA epoca que definiu `best_val_pearsonr`.
+    #
+    # Ate aqui eles so existiam no Aim, e `trials_table.py` reconstruia a epoca
+    # certa de la para poder imprimi-los -- dezenas de segundos por chamada, e
+    # duas fontes para o mesmo fato. Uma busca multiobjetivo em `val_in` x
+    # `val_ood` precisa deles DENTRO do laco, a cada trial, entao o custo deixa
+    # de caber e a segunda fonte deixa de ser aceitavel.
+    #
+    # Sao lidos de `best_pearsonr`, e nao de `callback_metrics`, exatamente para
+    # que a epoca seja a mesma: `callback_metrics` guarda a ULTIMA epoca, e
+    # publicar o estrato da ultima ao lado do pooled da melhor produziria duas
+    # procedencias dentro do mesmo JSON -- o defeito que tirou o
+    # `--eval-test-per-epoch` do template da campanha 3.
+    #
+    # Ausencia nao e erro: um estrato com menos de MIN_STRATUM_N pontos nao e
+    # logado, e um split sem coluna de estrato nao produz nenhum. Quem consome
+    # decide o que fazer com a falta, em vez de receber um zero silencioso.
+    for st in ("val_in", "val_ood"):
+        for k in ("pearsonr", "n"):
+            v = best_pearsonr.get(f"{st}_{k}")
+            if v is not None:
+                metrics[f"{st}_{k}"] = float(v)
+
     for name, value in trainer.callback_metrics.items():
         if name.startswith("test_"):
             metrics[name] = float(value)
