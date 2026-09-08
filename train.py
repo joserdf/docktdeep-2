@@ -1,5 +1,6 @@
 import argparse
 import glob
+import itertools
 import json
 import os
 import subprocess
@@ -13,6 +14,7 @@ import torch
 from aim.pytorch_lightning import AimLogger
 from docktgrid.view import BasicView, VolumeView
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from torch.optim.swa_utils import AveragedModel, get_ema_avg_fn
 
 from src.docktgrid_2.NewViewComplex import NewViewComplex
 from src.docktgrid_2.NewViewLigProt import NewViewLigProt
@@ -33,7 +35,10 @@ def run(args):
 
     pl.seed_everything(args.seed)
 
-    callbacks = configure_callbacks(args.early_stop_patience, args.val_monitor)
+    callbacks = configure_callbacks(
+        args.early_stop_patience, args.val_monitor,
+        early_stop_warmup=args.early_stop_warmup,
+        sema=args.sema, sema_decay=args.sema_decay)
     logger = configure_logger(args)
     track_files(logger)
 
@@ -214,17 +219,106 @@ def configure_logger(args):
     return logger
 
 
-def configure_callbacks(early_stop_patience: int = 0, val_monitor: str = "val_pearsonr"):
+class WarmupEarlyStopping(EarlyStopping):
+    """EarlyStopping que so comeca a contar a paciencia depois de um warmup.
+
+    O EarlyStopping padrao comeca a contar desde a epoca 0. Com curvas de
+    validacao ruidosas o pico costuma aparecer cedo e o patience pode cortar o
+    treino antes de o modelo amadurecer. `warmup_epochs` adia o inicio da
+    contagem: antes dele o callback apenas observa e nao incrementa a
+    paciencia nem atualiza o best (por isso o ModelCheckpoint, que monitora a
+    mesma metrica, continua selecionando o argmax de sempre — este callback so
+    muda *quando* o treino para, nao *o que* e guardado).
+    """
+
+    def __init__(self, warmup_epochs: int = 0, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.warmup_epochs = warmup_epochs
+        self._armed = warmup_epochs <= 0
+
+    def on_validation_end(self, trainer, pl_module):
+        if not self._armed and trainer.current_epoch >= self.warmup_epochs:
+            # Armado: o best deve comecar a partir do valor da epoca de warmup,
+            # nao do epoca 0 — senao o patience ja chega "queimado".
+            self._armed = True
+            logs = trainer.callback_metrics
+            if self.monitor in logs:
+                self.best_score = logs[self.monitor].squeeze().clone()
+                self.wait_count = 0
+        if not self._armed:
+            return
+        super().on_validation_end(trainer, pl_module)
+
+
+class SwitchEMA(pl.Callback):
+    """SEMA: Switch EMA (arXiv:2402.09240).
+
+    EMA classico mantem uma copia suavizada dos pesos (a media) e usa-a so
+    para validar/salvar; o modelo otimizado segue em paralelo e nunca recebe a
+    media. SEMA inverte isso: a cada epoca a media EMA e *devolvida* ao modelo
+    otimizado (o switch), de modo que a proxima epoca de otimizacao parte do
+    ponto suavizado. Isso combina a regularizacao implicita do EMA (picos de
+    ruido de validacao sao amortecidos, o checkpoint selecionado nao fica num
+    pico espurio) com a convergencia do gradiente.
+
+    Implementacao: usamos o `AveragedModel` do torch (com `get_ema_avg_fn`,
+    disponivel em qualquer versao de Lightning) e fazemos o switch no ciclo:
+      - `on_train_epoch_end`: atualiza a media EMA com os pesos otimizados e,
+        em seguida, copia a media DE VOLTA para o modelo otimizado. O proximo
+        epoch otimiza a partir do ponto suavizado.
+      - nao sobrescrevemos validacao: apos o switch o modelo atual ja E a
+        media, entao a validacao ja mede a media e o ModelCheckpoint (que
+        monitora a mesma metrica) salva o checkpoint suavizado — exatamente o
+        objetivo.
+    """
+
+    def __init__(self, decay: float = 0.999):
+        super().__init__()
+        self.decay = decay
+        self._average_model = None
+
+    def setup(self, trainer, pl_module, stage):
+        if stage == "fit":
+            self._average_model = AveragedModel(
+                model=pl_module, device=next(pl_module.parameters()).device,
+                use_buffers=True, avg_fn=get_ema_avg_fn(decay=self.decay))
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self._average_model is None:
+            return
+        # 1. incorpora os pesos otimizados na media EMA (uma vez por epoca)
+        self._average_model.update_parameters(pl_module)
+        # 2. switch: o modelo otimizado parte da media suavizada
+        self._copy_average_to_current(pl_module)
+
+    def on_train_end(self, trainer, pl_module):
+        if self._average_model is not None:
+            self._copy_average_to_current(pl_module)
+
+    def _copy_average_to_current(self, pl_module):
+        avg_params = itertools.chain(self._average_model.module.parameters(),
+                                     self._average_model.module.buffers())
+        cur_params = itertools.chain(pl_module.parameters(), pl_module.buffers())
+        for ap, cp in zip(avg_params, cur_params):
+            cp.data.copy_(ap.data)
+
+
+def configure_callbacks(early_stop_patience: int = 0, val_monitor: str = "val_pearsonr",
+                        early_stop_warmup: int = 0, sema: bool = False,
+                        sema_decay: float = 0.999):
     monitor, mode = val_monitor, "max"
     callbacks = [
         # save_last: essencial p/ o pause/migracao do broker — sem ele so o
         # "best" e guardado e o resume voltaria ate o melhor epoch (nao ao ultimo).
         ModelCheckpoint(monitor=monitor, mode=mode, save_top_k=1, save_last=True),
     ]
+    if sema:
+        callbacks.append(SwitchEMA(decay=sema_decay))
     if early_stop_patience > 0:
         # Early stopping para cortar o rabo sobre-treinado
-        callbacks.append(EarlyStopping(monitor=monitor, mode=mode,
-                                       patience=early_stop_patience))
+        callbacks.append(WarmupEarlyStopping(
+            warmup_epochs=early_stop_warmup, monitor=monitor, mode=mode,
+            patience=early_stop_patience))
     return callbacks
 
 
@@ -275,6 +369,17 @@ def get_parser():
     trainer_parser.add_argument("--early-stop-patience", type=int, default=50,
                                 help="parar apos N epochs sem melhorar val_pearsonr "
                                      "(0 = desligado; default 50 — RESULTS-MEASURED §21)")
+    trainer_parser.add_argument("--early-stop-warmup", type=int, default=0,
+                                help="nao contar a paciencia do early stopping "
+                                     "antes desta epoca (0 = desligado). So muda "
+                                     "*quando* o treino para, nao o que o "
+                                     "ModelCheckpoint guarda (continua o argmax).")
+    trainer_parser.add_argument("--sema", action="store_true",
+                                help="SEMA (Switch EMA): media exponencial dos "
+                                     "pesos devolvida ao modelo a cada epoca, "
+                                     "para suavizar picos de ruido de validacao.")
+    trainer_parser.add_argument("--sema-decay", type=float, default=0.999,
+                                help="decay da media EMA do --sema.")
     trainer_parser.add_argument("--val-monitor", type=str, default="val_pearsonr",
                                 help="Metric to monitor for ModelCheckpoint and EarlyStopping.")
     # resume (broker pause/migracao): o worker injeta esses argumentos quando
