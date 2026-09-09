@@ -30,6 +30,9 @@ from src.docktdeep.transforms import MolecularDropout, Random90DegreesRotation
 
 
 def run(args):
+    if args.sema and args.ema:
+        sys.exit("--sema e --ema sao exclusivos: um devolve a media ao modelo "
+                 "otimizado, o outro nao.")
     torch.set_float32_matmul_precision("medium")
     dotenv.load_dotenv()
 
@@ -38,7 +41,8 @@ def run(args):
     callbacks = configure_callbacks(
         args.early_stop_patience, args.val_monitor,
         early_stop_warmup=args.early_stop_warmup,
-        sema=args.sema, sema_decay=args.sema_decay)
+        sema=args.sema, sema_decay=args.sema_decay,
+        ema=args.ema, ema_decay=args.ema_decay, topk_avg=args.topk_avg)
     logger = configure_logger(args)
     track_files(logger)
 
@@ -94,9 +98,47 @@ def run(args):
             print(f"[ckpt] winner=prior-best (val_pearsonr={prior_score:.4f})", flush=True)
         trainer.test(model, datamodule=data_module, ckpt_path=winner)
 
+    if args.topk_avg > 1:
+        _avaliar_topk_avg(trainer, model, data_module, ckpt_cb, args.topk_avg)
+
     emit_metrics_line(trainer, model, args)
 
     return trainer
+
+
+def _avaliar_topk_avg(trainer, model, data_module, ckpt_cb, k: int) -> None:
+    """Valida a media dos pesos dos K melhores checkpoints (model soup).
+
+    O resultado sai como metrica PROPRIA (`topk_avg_val_pearsonr`), e nao
+    substituindo `best_val_pearsonr`: cada run passa a dar o par
+    (melhor epoca isolada, media das K melhores) medido no mesmo fold e na
+    mesma semente, que e a comparacao que interessa.
+    """
+    paths = [p for p in ckpt_cb.best_k_models if os.path.exists(p)]
+    if len(paths) < 2:
+        print(f"[topk-avg] so {len(paths)} checkpoint(s) em disco; pulando",
+              flush=True)
+        return
+    model.load_state_dict(average_state_dicts(paths))
+
+    # trainer.validate acrescenta uma entrada a validation_logs; ela e removida
+    # em seguida para nao entrar no argmax que define best_val_pearsonr.
+    logs = getattr(model, "validation_logs", [])
+    n_antes = len(logs)
+    trainer.validate(model, datamodule=data_module, verbose=False)
+    extras = logs[n_antes:]
+    del logs[n_antes:]
+    if not extras:
+        print("[topk-avg] validacao nao produziu log; pulando", flush=True)
+        return
+    model._topk_avg_metrics = {
+        "topk_avg_val_pearsonr": float(extras[-1]["val_pearsonr"]),
+        "topk_avg_val_loss": float(extras[-1]["val_loss"]),
+        "topk_avg_k": float(len(paths)),
+    }
+    print(f"[topk-avg] k={len(paths)} "
+          f"val_pearsonr={model._topk_avg_metrics['topk_avg_val_pearsonr']:.4f}",
+          flush=True)
 
 
 def _load_best_score(ckpt_path: str):
@@ -176,6 +218,9 @@ def emit_metrics_line(trainer, model, args) -> None:
     for name, value in trainer.callback_metrics.items():
         if name.startswith("test_"):
             metrics[name] = float(value)
+
+    # media dos K melhores checkpoints (--topk-avg), quando houver
+    metrics.update(getattr(model, "_topk_avg_metrics", {}))
 
     print(json.dumps({"experiment": args.experiment, "seed": args.seed,
                       "metrics": metrics}), flush=True)
@@ -309,17 +354,99 @@ class SwitchEMA(pl.Callback):
             cp.data.copy_(ap.data)
 
 
+def _params_and_buffers(module):
+    """Parametros e buffers na mesma ordem, para copiar um modelo no outro."""
+    return itertools.chain(module.parameters(), module.buffers())
+
+
+class ClassicEMA(pl.Callback):
+    """EMA classico: a media suavizada e usada SO para validar e salvar.
+
+    Diferenca para o `SwitchEMA`: o modelo otimizado nunca recebe a media. A
+    troca acontece apenas em volta da validacao, de modo que `validation_logs`
+    e o `ModelCheckpoint` medem a media, enquanto a proxima epoca de treino
+    continua do ponto nao suavizado. E a variante em que o EMA e um estimador,
+    nao uma intervencao no otimizador.
+
+    A media e atualizada por PASSO (o `decay` e uma constante por passo: o
+    horizonte e 1/(1-decay) passos). Com ~32 passos/epoca neste dataset,
+    0.99 cobre ~3 epocas.
+
+    A restauracao dos pesos acontece em `on_train_epoch_start`, e nao em
+    `on_validation_end`: o Lightning reordena os ModelCheckpoint para o fim da
+    lista de callbacks, entao restaurar em `on_validation_end` desfaria a troca
+    ANTES de o checkpoint ser gravado — e o arquivo salvo nao seria a media.
+    """
+
+    def __init__(self, decay: float = 0.99):
+        super().__init__()
+        self.decay = decay
+        self._average_model = None
+        self._stash = None
+
+    def setup(self, trainer, pl_module, stage):
+        if stage == "fit":
+            self._average_model = AveragedModel(
+                model=pl_module, device=next(pl_module.parameters()).device,
+                use_buffers=True, avg_fn=get_ema_avg_fn(decay=self.decay))
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if self._average_model is not None:
+            self._average_model.update_parameters(pl_module)
+
+    def on_validation_start(self, trainer, pl_module):
+        # guarda os pesos otimizados e coloca a media no lugar
+        if self._average_model is None or self._stash is not None:
+            return
+        self._stash = [t.detach().clone() for t in _params_and_buffers(pl_module)]
+        for ap, cp in zip(_params_and_buffers(self._average_model.module),
+                          _params_and_buffers(pl_module)):
+            cp.data.copy_(ap.data)
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        # o checkpoint da validacao anterior ja foi gravado; devolve os pesos
+        if self._stash is None:
+            return
+        for saved, cp in zip(self._stash, _params_and_buffers(pl_module)):
+            cp.data.copy_(saved)
+        self._stash = None
+
+
+def average_state_dicts(paths: list[str]) -> dict:
+    """Media aritmetica dos state_dicts de varios checkpoints (model soup).
+
+    Buffers inteiros (`num_batches_tracked` das BatchNorm) sao acumulados em
+    float e devolvidos ao dtype original: a media de um contador nao e um
+    contador, mas manter o dtype evita que o load_state_dict recuse a chave.
+    """
+    acc, dtypes = None, None
+    for path in paths:
+        sd = torch.load(path, map_location="cpu", weights_only=False)["state_dict"]
+        if acc is None:
+            dtypes = {k: v.dtype for k, v in sd.items()}
+            acc = {k: v.double().clone() for k, v in sd.items()}
+        else:
+            for k in acc:
+                acc[k] += sd[k].double()
+    return {k: (v / len(paths)).to(dtypes[k]) for k, v in acc.items()}
+
+
 def configure_callbacks(early_stop_patience: int = 0, val_monitor: str = "val_pearsonr",
                         early_stop_warmup: int = 0, sema: bool = False,
-                        sema_decay: float = 0.999):
+                        sema_decay: float = 0.999, ema: bool = False,
+                        ema_decay: float = 0.99, topk_avg: int = 1):
     monitor, mode = val_monitor, "max"
     callbacks = [
         # save_last: essencial p/ o pause/migracao do broker — sem ele so o
         # "best" e guardado e o resume voltaria ate o melhor epoch (nao ao ultimo).
-        ModelCheckpoint(monitor=monitor, mode=mode, save_top_k=1, save_last=True),
+        # save_top_k: >1 so com --topk-avg, que precisa dos K melhores em disco.
+        ModelCheckpoint(monitor=monitor, mode=mode, save_top_k=max(1, topk_avg),
+                        save_last=True),
     ]
     if sema:
         callbacks.append(SwitchEMA(decay=sema_decay))
+    if ema:
+        callbacks.append(ClassicEMA(decay=ema_decay))
     if early_stop_patience > 0:
         # Early stopping para cortar o rabo sobre-treinado
         callbacks.append(WarmupEarlyStopping(
@@ -386,6 +513,19 @@ def get_parser():
                                      "para suavizar picos de ruido de validacao.")
     trainer_parser.add_argument("--sema-decay", type=float, default=0.999,
                                 help="decay da media EMA do --sema.")
+    trainer_parser.add_argument("--ema", action="store_true",
+                                help="EMA classico: a media suavizada e usada so "
+                                     "para validar/salvar; o treino segue nos pesos "
+                                     "otimizados. Exclusivo com --sema.")
+    trainer_parser.add_argument("--ema-decay", type=float, default=0.99,
+                                help="decay da media do --ema, POR PASSO. O horizonte "
+                                     "e 1/(1-decay) passos; com ~32 passos/epoca, "
+                                     "0.99 cobre ~3 epocas.")
+    trainer_parser.add_argument("--topk-avg", type=int, default=1,
+                                help="media dos pesos dos K melhores checkpoints "
+                                     "(model soup). K>1 faz o ModelCheckpoint guardar "
+                                     "K arquivos e publica topk_avg_val_pearsonr ao "
+                                     "lado de best_val_pearsonr.")
     trainer_parser.add_argument("--val-monitor", type=str, default="val_pearsonr",
                                 help="Metric to monitor for ModelCheckpoint and EarlyStopping.")
     # resume (broker pause/migracao): o worker injeta esses argumentos quando
