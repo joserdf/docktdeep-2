@@ -263,9 +263,11 @@ class SwitchEMA(pl.Callback):
 
     Implementacao: usamos o `AveragedModel` do torch (com `get_ema_avg_fn`,
     disponivel em qualquer versao de Lightning) e fazemos o switch no ciclo:
-      - `on_train_epoch_end`: atualiza a media EMA com os pesos otimizados e,
-        em seguida, copia a media DE VOLTA para o modelo otimizado. O proximo
-        epoch otimiza a partir do ponto suavizado.
+      - `on_train_batch_end`: atualiza a media EMA com os pesos otimizados. O
+        decay e uma constante POR PASSO; atualizar uma vez por epoca deixava a
+        media presa nos pesos iniciais (0.999^50 ~ 0.95 depois de 50 epocas).
+      - `on_train_epoch_end`: copia a media DE VOLTA para o modelo otimizado (o
+        switch). O proximo epoch otimiza a partir do ponto suavizado.
       - nao sobrescrevemos validacao: apos o switch o modelo atual ja E a
         media, entao a validacao ja mede a media e o ModelCheckpoint (que
         monitora a mesma metrica) salva o checkpoint suavizado — exatamente o
@@ -283,12 +285,16 @@ class SwitchEMA(pl.Callback):
                 model=pl_module, device=next(pl_module.parameters()).device,
                 use_buffers=True, avg_fn=get_ema_avg_fn(decay=self.decay))
 
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        # incorpora os pesos otimizados na media EMA a cada PASSO: `decay` e
+        # uma constante por passo, nao por epoca.
+        if self._average_model is not None:
+            self._average_model.update_parameters(pl_module)
+
     def on_train_epoch_end(self, trainer, pl_module):
         if self._average_model is None:
             return
-        # 1. incorpora os pesos otimizados na media EMA (uma vez por epoca)
-        self._average_model.update_parameters(pl_module)
-        # 2. switch: o modelo otimizado parte da media suavizada
+        # switch: o modelo otimizado parte da media suavizada (uma vez por epoca)
         self._copy_average_to_current(pl_module)
 
     def on_train_end(self, trainer, pl_module):
