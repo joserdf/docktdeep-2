@@ -187,7 +187,13 @@ def _receitas(pool: dict, best_path: str, args) -> dict:
 
 
 def _metricas_da_sopa(trainer, model, data_module, paths: list[str]):
-    """Media os pesos, valida, e devolve (val_pearsonr, val_loss). None se nao der.
+    """Media os pesos, valida, e devolve o log INTEIRO da validacao. None se nao der.
+
+    Devolvia so `(val_pearsonr, val_loss)`. Agora devolve o dicionario todo
+    porque `on_validation_epoch_end` poe os estratos (`val_in_*`, `val_ood_*`)
+    na mesma entrada, e uma busca multiobjetivo em `val_in` x `val_ood` precisa
+    deles para a sopa tambem -- sem isso, ligar a sopa nao teria como mover o
+    objetivo, e o eixo seria um gene neutro consumindo populacao.
 
     A entrada que o trainer.validate acrescenta a validation_logs e removida em
     seguida: sem isso a sopa entraria no argmax que define best_val_pearsonr, e
@@ -201,7 +207,7 @@ def _metricas_da_sopa(trainer, model, data_module, paths: list[str]):
     del logs[n_antes:]
     if not extras:
         return None
-    return float(extras[-1]["val_pearsonr"]), float(extras[-1]["val_loss"])
+    return {k: float(v) for k, v in extras[-1].items()}
 
 
 def _avaliar_sopas(trainer, model, data_module, pool: dict, best_path: str,
@@ -231,10 +237,18 @@ def _avaliar_sopas(trainer, model, data_module, pool: dict, best_path: str,
         if r is None:
             print(f"[sopa] {nome}: validacao nao produziu log; pulando", flush=True)
             continue
-        pearson, loss = r
+        pearson, loss = r["val_pearsonr"], r["val_loss"]
         eps = [e for e in map(_epoca_do_ckpt, paths) if e is not None]
         metricas[f"soup_{nome}_val_pearsonr"] = pearson
         metricas[f"soup_{nome}_val_loss"] = loss
+        # Estratos da sopa, quando o split os tem. Mesma regra do
+        # `emit_metrics_line`: ausencia nao vira zero, a chave simplesmente nao
+        # sai -- um estrato com menos de MIN_STRATUM_N pontos nao e logado, e um
+        # split sem coluna de estrato nao produz nenhum.
+        for st in ("val_in", "val_ood"):
+            for k in ("pearsonr", "n"):
+                if f"{st}_{k}" in r:
+                    metricas[f"soup_{nome}_{st}_{k}"] = r[f"{st}_{k}"]
         metricas[f"soup_{nome}_k"] = float(len(paths))
         metricas[f"soup_{nome}_epoch_span"] = float(max(eps) - min(eps)) if eps else -1.0
         print(f"[sopa] {nome}: k={len(paths)} epocas={sorted(eps)} "
@@ -243,7 +257,8 @@ def _avaliar_sopas(trainer, model, data_module, pool: dict, best_path: str,
     # A v3 continua publicada com os nomes antigos: as ferramentas de analise
     # ja construidas leem `topk_avg_*`, e renomea-las quebraria a comparacao
     # com os bracos topk-test, v2 e v3 ja medidos.
-    for sufixo in ("val_pearsonr", "val_loss", "k", "epoch_span"):
+    for sufixo in ("val_pearsonr", "val_loss", "k", "epoch_span",
+                   "val_in_pearsonr", "val_in_n", "val_ood_pearsonr", "val_ood_n"):
         if f"soup_v3_{sufixo}" in metricas:
             alvo = "topk_avg_" + ("epoch_span" if sufixo == "epoch_span" else sufixo)
             metricas[alvo] = metricas[f"soup_v3_{sufixo}"]
