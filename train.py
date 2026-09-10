@@ -3,6 +3,7 @@ import glob
 import itertools
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -79,6 +80,9 @@ def run(args):
     # que era quando aquela epoca foi salva. Medido: `topk_avg_k` saia igual a
     # posicao cronologica do melhor checkpoint (2 ou 3), nunca 5.
     topk_paths = [p for p in ckpt_cb.best_k_models if os.path.exists(p)]
+    if args.topk_window > 0:
+        topk_paths = _filtrar_por_janela(topk_paths, ckpt_cb.best_model_path,
+                                         args.topk_window)
     for tag, path in (("last", ckpt_cb.last_model_path), ("best", ckpt_cb.best_model_path)):
         if path:
             # Contrato do worker do broker (agent.py::_parse_ckpt_path): a pausa
@@ -120,6 +124,31 @@ def run(args):
     return trainer
 
 
+def _epoca_do_ckpt(path: str) -> int | None:
+    m = re.search(r"epoch=(\d+)", os.path.basename(str(path)))
+    return int(m.group(1)) if m else None
+
+
+def _filtrar_por_janela(paths: list[str], best_path: str, janela: int) -> list[str]:
+    """Mantem so os checkpoints a menos de `janela` epocas do melhor.
+
+    Media de pesos pressupoe que os pontos estejam na MESMA bacia. Medido no
+    topk-test-v2: um run cuja sopa juntou as epocas 2, 5, 9, 12 e 47 perdeu
+    0.1342 de val_pearsonr, enquanto a mediana dos outros 14 runs era +0.0050.
+    A janela e o unico parametro que separa "media de pesos vizinhos" de
+    "media entre dois modelos diferentes".
+    """
+    best_ep = _epoca_do_ckpt(best_path)
+    if best_ep is None:
+        return paths
+    dentro = [p for p in paths
+              if (e := _epoca_do_ckpt(p)) is not None and abs(e - best_ep) <= janela]
+    if len(dentro) < len(paths):
+        print(f"[topk-avg] janela {janela} em torno da epoca {best_ep}: "
+              f"{len(dentro)} de {len(paths)} checkpoints", flush=True)
+    return dentro or paths
+
+
 def _avaliar_topk_avg(trainer, model, data_module, paths: list[str]) -> None:
     """Valida a media dos pesos dos K melhores checkpoints (model soup).
 
@@ -149,6 +178,8 @@ def _avaliar_topk_avg(trainer, model, data_module, paths: list[str]) -> None:
         "topk_avg_val_pearsonr": float(extras[-1]["val_pearsonr"]),
         "topk_avg_val_loss": float(extras[-1]["val_loss"]),
         "topk_avg_k": float(len(paths)),
+        "topk_avg_epoch_span": float(max(eps) - min(eps)) if (
+            eps := [e for e in map(_epoca_do_ckpt, paths) if e is not None]) else -1.0,
     }
     print(f"[topk-avg] k={len(paths)} "
           f"val_pearsonr={model._topk_avg_metrics['topk_avg_val_pearsonr']:.4f}",
@@ -539,6 +570,9 @@ def get_parser():
                                 help="decay da media do --ema, POR PASSO. O horizonte "
                                      "e 1/(1-decay) passos; com ~32 passos/epoca, "
                                      "0.99 cobre ~3 epocas.")
+    trainer_parser.add_argument("--topk-window", type=int, default=0,
+                                help="so mistura checkpoints a menos de N "
+                                     "epocas do melhor (0 = sem janela)")
     trainer_parser.add_argument("--topk-avg", type=int, default=1,
                                 help="media dos pesos dos K melhores checkpoints "
                                      "(model soup). K>1 faz o ModelCheckpoint guardar "
