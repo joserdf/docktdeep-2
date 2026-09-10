@@ -73,6 +73,12 @@ def run(args):
     trainer.fit(model, datamodule=data_module, ckpt_path=args.ckpt_path)
 
     ckpt_cb = next(c for c in trainer.callbacks if isinstance(c, ModelCheckpoint))
+    # Snapshot dos K melhores AGORA, antes do trainer.test abaixo. O test roda
+    # com ckpt_path="best", e carregar um checkpoint restaura o estado dos
+    # callbacks gravado DENTRO dele -- o que rebobina `best_k_models` para o
+    # que era quando aquela epoca foi salva. Medido: `topk_avg_k` saia igual a
+    # posicao cronologica do melhor checkpoint (2 ou 3), nunca 5.
+    topk_paths = [p for p in ckpt_cb.best_k_models if os.path.exists(p)]
     for tag, path in (("last", ckpt_cb.last_model_path), ("best", ckpt_cb.best_model_path)):
         if path:
             # Contrato do worker do broker (agent.py::_parse_ckpt_path): a pausa
@@ -99,14 +105,14 @@ def run(args):
         trainer.test(model, datamodule=data_module, ckpt_path=winner)
 
     if args.topk_avg > 1:
-        _avaliar_topk_avg(trainer, model, data_module, ckpt_cb, args.topk_avg)
+        _avaliar_topk_avg(trainer, model, data_module, topk_paths)
 
     emit_metrics_line(trainer, model, args)
 
     return trainer
 
 
-def _avaliar_topk_avg(trainer, model, data_module, ckpt_cb, k: int) -> None:
+def _avaliar_topk_avg(trainer, model, data_module, paths: list[str]) -> None:
     """Valida a media dos pesos dos K melhores checkpoints (model soup).
 
     O resultado sai como metrica PROPRIA (`topk_avg_val_pearsonr`), e nao
@@ -114,7 +120,7 @@ def _avaliar_topk_avg(trainer, model, data_module, ckpt_cb, k: int) -> None:
     (melhor epoca isolada, media das K melhores) medido no mesmo fold e na
     mesma semente, que e a comparacao que interessa.
     """
-    paths = [p for p in ckpt_cb.best_k_models if os.path.exists(p)]
+    paths = [p for p in paths if os.path.exists(p)]
     if len(paths) < 2:
         print(f"[topk-avg] so {len(paths)} checkpoint(s) em disco; pulando",
               flush=True)
