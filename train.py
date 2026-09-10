@@ -103,6 +103,14 @@ def run(args):
             winner = args.prior_best_path
             print(f"[ckpt] winner=prior-best (val_pearsonr={prior_score:.4f})", flush=True)
         trainer.test(model, datamodule=data_module, ckpt_path=winner)
+        # Congela as metricas de test AGORA. `trainer.callback_metrics` e
+        # zerado no inicio de cada estagio, e _avaliar_topk_avg abaixo roda um
+        # trainer.validate() -- que apagava todo `test_*` do dicionario. Efeito
+        # medido no refit: os runs com --topk-avg entregaram sopa OU
+        # test_pearsonr, nunca os dois, conforme a sopa tivesse rodado ou nao.
+        model._test_metrics = {k: float(v) for k, v in
+                               trainer.callback_metrics.items()
+                               if k.startswith("test_")}
 
     if args.topk_avg > 1:
         _avaliar_topk_avg(trainer, model, data_module, topk_paths)
@@ -221,9 +229,13 @@ def emit_metrics_line(trainer, model, args) -> None:
             if v is not None:
                 metrics[f"{st}_{k}"] = float(v)
 
-    for name, value in trainer.callback_metrics.items():
-        if name.startswith("test_"):
-            metrics[name] = float(value)
+    # `_test_metrics` e o snapshot tirado logo apos o trainer.test em run();
+    # o fallback cobre os caminhos que nao testam (--merge-val-test).
+    testes = getattr(model, "_test_metrics", None)
+    if testes is None:
+        testes = {k: float(v) for k, v in trainer.callback_metrics.items()
+                  if k.startswith("test_")}
+    metrics.update(testes)
 
     # media dos K melhores checkpoints (--topk-avg), quando houver
     metrics.update(getattr(model, "_topk_avg_metrics", {}))
