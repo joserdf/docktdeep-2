@@ -83,6 +83,32 @@ def test_pool_vazio_nao_inventa_selecao():
     assert _receita_final({}, BEST, 5, 25, 0.01, "abs") == []
 
 
+def test_janela_e_tolerancia_sao_omissiveis():
+    """So --soup-k e obrigatorio; cada restricao omitida nao se aplica.
+
+    Sem janela, os outliers temporais (epocas 2 e 10) voltam a ser elegiveis --
+    e exatamente o modo que perdeu 0.1342, por isso o run avisa no log.
+    """
+    assert receita(k=9, janela=None, tol=None) == receita(k=9, janela=0, tol=None)
+    assert {2, 10} <= set(receita(k=9, janela=None, tol=None))
+    # so K limitando: os 3 melhores do pool inteiro, sem nenhum filtro
+    assert len(receita(k=3, janela=None, tol=None)) == 3
+    # so a janela limitando: nenhum corte por score
+    assert receita(k=99, janela=25, tol=None) == receita(k=99, janela=25, tol=0.5)
+
+
+def test_selecao_de_tamanho_1_e_sempre_o_melhor():
+    """Base do tratamento de k=1: o unico sobrevivente e o best, nunca outro.
+
+    Vale porque a janela e centrada nele e a tolerancia e medida a partir dele.
+    Sem esta garantia, `soup_degenerada` poderia marcar um checkpoint qualquer.
+    """
+    for janela in (None, 0, 1, 25):
+        for tol in (0.0, 0.0001):
+            assert receita(k=1, janela=janela, tol=tol) == [50]
+            assert receita(k=9, janela=janela, tol=tol) == [50]
+
+
 def rodar(monkeypatch, log, **flags):
     args = types.SimpleNamespace(soup_k=5, soup_window=25, soup_tol=0.01,
                                  soup_tol_mode="abs")
@@ -123,6 +149,17 @@ def test_k1_publica_em_vez_de_se_abster(monkeypatch):
     assert m["soup_k"] == 1.0
     assert m["soup_epoch_span"] == 0.0
     assert m["soup_val_pearsonr"] == 0.6420
+
+
+def test_k1_e_marcado_como_degenerado(monkeypatch):
+    """`soup_k=1` sozinho obriga quem le a inferir; a marca diz.
+
+    Um k=1 nao e "uma sopa que nao ajudou": nao houve media nenhuma, e o delta
+    contra a melhor epoca e zero por construcao. Entrando sem marca nas medias,
+    ele dilui o efeito medido com zeros que nao sao medicoes.
+    """
+    assert rodar(monkeypatch, LOG, soup_tol=0.0)["soup_degenerada"] == 1.0
+    assert rodar(monkeypatch, LOG)["soup_degenerada"] == 0.0
 
 
 def test_estrato_ausente_nao_vira_zero(monkeypatch):

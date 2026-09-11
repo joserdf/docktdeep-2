@@ -34,6 +34,18 @@ def run(args):
     if args.sema and args.ema:
         sys.exit("--sema e --ema sao exclusivos: um devolve a media ao modelo "
                  "otimizado, o outro nao.")
+    if args.soup and args.soup_k is None:
+        sys.exit("--soup exige --soup-k: o teto do tamanho e o unico parametro "
+                 "sem default seguro. Janela e tolerancia podem ser omitidas "
+                 "(a restricao simplesmente nao se aplica); um K implicito "
+                 "decidiria em silencio quantos pesos entram na media.")
+    if args.soup and args.soup_tol is None and args.soup_tol_mode is not None:
+        sys.exit("--soup-tol-mode sem --soup-tol nao faz nada. Ou passe a "
+                 "tolerancia, ou omita o modo.")
+    if args.soup and args.soup_window is None:
+        print("[sopa] AVISO: sem --soup-window nao ha guarda de bacia. Medido: "
+              "um run juntou as epocas 2, 5, 9, 12 e 47 e perdeu 0.1342 de "
+              "val_pearsonr.", flush=True)
     if args.soup and args.topk_avg > 1:
         sys.exit("--soup e --topk-avg sao exclusivos: o primeiro e a receita "
                  "final, o segundo e a grade experimental v3-v6 que a "
@@ -158,13 +170,15 @@ def _na_janela(pool: dict, best_path: str, janela: int) -> dict:
     return dentro or dict(pool)
 
 
-def _receita_final(pool: dict, best_path: str, k: int, janela: int,
-                   tol: float, modo: str) -> list[str]:
-    """A receita do estudo: janela, tolerancia ao top-1, e no maximo K.
+def _receita_final(pool: dict, best_path: str, k: int,
+                   janela: int | None = None, tol: float | None = None,
+                   modo: str | None = None) -> list[str]:
+    """A receita do estudo: no maximo K, opcionalmente limitados por janela e
+    por distancia ao top-1.
 
-    Tres restricoes, nesta leitura: dos checkpoints a menos de `janela` epocas
-    do melhor, ficam os que estao a menos de `tol` do top-1, e desses os `k`
-    melhores.
+    So `k` e obrigatorio. `janela=None` desliga a guarda de bacia e `tol=None`
+    desliga o corte por score; cada restricao omitida simplesmente nao se
+    aplica, em vez de assumir um valor.
 
     A ordem entre a tolerancia e o corte em K nao importa: as duas operam sobre
     o mesmo ranking de score, entao filtrar-depois-truncar e truncar-depois-
@@ -173,33 +187,48 @@ def _receita_final(pool: dict, best_path: str, k: int, janela: int,
 
     O top-1 da janela e sempre o top-1 global: `_na_janela` centra a janela no
     proprio melhor checkpoint, que por isso nunca e excluido. Isso garante que
-    a sopa nunca fica vazia e que `tol` significa sempre "distancia ao melhor
-    checkpoint do treino", nao "ao melhor da vizinhanca".
+    a sopa nunca fica vazia com pool nao-vazio, que `tol` significa sempre
+    "distancia ao melhor checkpoint do treino", e que uma selecao de tamanho 1
+    e necessariamente o proprio melhor checkpoint.
 
-    `modo` e 'abs' (tol em unidades da metrica) ou 'rel' (fracao do top-1).
-    Medido na grade v3-v6: para um val_pearsonr que vive perto de 0.62, um
-    rel de 0.05 vale 0.031 -- tres vezes mais frouxo que um abs de 0.01. Os
-    dois nao sao intercambiaveis, e e por isso que o modo e explicito.
+    `modo` e 'abs' (tol em unidades da metrica) ou 'rel' (fracao do top-1);
+    so e lido quando `tol` existe. Medido na grade v3-v6: para um val_pearsonr
+    que vive perto de 0.62, um rel de 0.05 vale 0.031 -- tres vezes mais frouxo
+    que um abs de 0.01. Os dois nao sao intercambiaveis, e e por isso que o
+    modo e explicito.
     """
-    dentro = _na_janela(pool, best_path, janela)
+    dentro = _na_janela(pool, best_path, janela or 0)
     ordenado = sorted(dentro.items(), key=lambda kv: -kv[1])
     if not ordenado:
         return []
+    escolhidos = ordenado[:k]
+    if tol is None:
+        return [p for p, _ in escolhidos]
     top1 = ordenado[0][1]
     limite = top1 - (abs(top1) * tol if modo == "rel" else tol)
-    return [p for p, v in ordenado[:k] if v >= limite]
-
+    return [p for p, v in escolhidos if v >= limite]
 
 def _avaliar_sopa_final(trainer, model, data_module, pool: dict, best_path: str,
                         args) -> None:
     """Avalia a receita final e publica as metricas `soup_*`.
 
-    Diferenca deliberada em relacao a grade v3-v6: aqui NAO se pula quando a
-    selecao degenera para um unico checkpoint. A v6 se abstinha nesses casos e
-    o resultado era uma coluna com buracos -- 17 runs de 19 --, o que obriga
-    quem le a tratar "sem sopa" e "sopa que nao ajudou" como a mesma coisa.
-    Com k=1 a sopa e o proprio melhor checkpoint; o numero e valido, e
-    `soup_k` diz exatamente o que aconteceu.
+    Sobre o caso degenerado (k=1): a selecao virou o proprio melhor checkpoint,
+    porque a janela ou a tolerancia nao deixaram nenhum vizinho entrar. Tres
+    decisoes aqui, todas deliberadas:
+
+    1. Publica em vez de se abster. A receita v6 pulava nesses casos e a coluna
+       saia com buracos -- 17 runs de 19 --, o que obriga quem le a tratar "nao
+       houve sopa" e "a sopa nao ajudou" como a mesma coisa.
+    2. Valida de verdade, em vez de reaproveitar `pool[best_path]`. O score que
+       o ModelCheckpoint guardou vem da epoca de validacao durante o treino; o
+       das sopas com k>1 vem de um `trainer.validate` posterior. Reaproveitar o
+       primeiro faria `soup_val_pearsonr` mudar de caminho de medicao conforme
+       o k, e a comparacao k=1 vs k=5 deixaria de ser pareada. Custa uma
+       passada de validacao num caso raro.
+    3. Marca com `soup_degenerada=1.0`. Sem isso, um k=1 entra nas medias como
+       se fosse uma sopa que nao ajudou, quando na verdade nao houve media
+       nenhuma -- e o delta contra a melhor epoca e zero por construcao, nao
+       por medicao.
     """
     paths = sorted(set(_receita_final(pool, best_path, args.soup_k,
                                       args.soup_window, args.soup_tol,
@@ -207,6 +236,13 @@ def _avaliar_sopa_final(trainer, model, data_module, pool: dict, best_path: str,
     if not paths:
         print("[sopa] pool vazio; pulando", flush=True)
         return
+    degenerada = len(paths) == 1
+    if degenerada:
+        # `_receita_final` garante que o unico sobrevivente e o best: a janela e
+        # centrada nele e a tolerancia e medida a partir dele.
+        print("[sopa] k=1: nenhum vizinho elegivel, a sopa e o proprio melhor "
+              "checkpoint. Afrouxe --soup-window ou --soup-tol para mistura "
+              "de fato acontecer.", flush=True)
     r = _metricas_da_sopa(trainer, model, data_module, paths)
     if r is None:
         print("[sopa] validacao nao produziu log; pulando", flush=True)
@@ -218,6 +254,7 @@ def _avaliar_sopa_final(trainer, model, data_module, pool: dict, best_path: str,
         "soup_k": float(len(paths)),
         "soup_epoch_span": float(max(eps) - min(eps)) if eps else -1.0,
         "soup_pool": float(len(pool)),
+        "soup_degenerada": 1.0 if degenerada else 0.0,
     }
     for st in ("val_in", "val_ood"):
         for chave in ("pearsonr", "n"):
@@ -229,7 +266,6 @@ def _avaliar_sopa_final(trainer, model, data_module, pool: dict, best_path: str,
     print(f"[sopa] final: k={len(paths)} epocas={sorted(eps)} "
           f"span={metricas['soup_epoch_span']:.0f} "
           f"val_pearsonr={r['val_pearsonr']:.4f}", flush=True)
-
 
 def _receitas(pool: dict, best_path: str, args) -> dict:
     """As receitas de sopa, todas sobre o MESMO treino e o mesmo pool.
@@ -646,7 +682,7 @@ def configure_callbacks(early_stop_patience: int = 0, val_monitor: str = "val_pe
                         sema_decay: float = 0.999, ema: bool = False,
                         ema_decay: float = 0.99, topk_avg: int = 1,
                         topk_pool: int = 0, soup: bool = False,
-                        soup_k: int = 5, soup_pool: int = 0):
+                        soup_k: int | None = None, soup_pool: int = 0):
     monitor, mode = val_monitor, "max"
     callbacks = [
         # save_last: essencial p/ o pause/migracao do broker — sem ele so o
@@ -656,7 +692,7 @@ def configure_callbacks(early_stop_patience: int = 0, val_monitor: str = "val_pe
         # por janela antes de escolher precisam de candidatos sobrando, senao
         # o filtro so consegue encolher a sopa, nunca trocar seus membros.
         ModelCheckpoint(monitor=monitor, mode=mode,
-                        save_top_k=(max(1, soup_pool or soup_k) if soup
+                        save_top_k=(max(1, soup_pool or soup_k or 1) if soup
                                     else max(1, topk_pool or topk_avg)),
                         save_last=True),
     ]
@@ -740,31 +776,38 @@ def get_parser():
                                      "0.99 cobre ~3 epocas.")
     trainer_parser.add_argument("--soup", action="store_true",
                                 help="RECEITA FINAL do estudo: media dos pesos "
-                                     "dos ate --soup-k melhores checkpoints que "
-                                     "estejam a menos de --soup-window epocas e "
-                                     "a menos de --soup-tol do melhor. Publica "
-                                     "soup_val_pearsonr ao lado de "
-                                     "best_val_pearsonr. Exclusiva com --topk-avg.")
-    trainer_parser.add_argument("--soup-k", type=int, default=5,
-                                help="tamanho maximo da sopa (default 5)")
-    trainer_parser.add_argument("--soup-window", type=int, default=25,
-                                help="so mistura checkpoints a menos de N epocas "
-                                     "do melhor (0 = sem janela). E a guarda de "
-                                     "bacia: sem ela, um run juntou as epocas "
-                                     "2, 5, 9, 12 e 47 e perdeu 0.1342.")
-    trainer_parser.add_argument("--soup-tol", type=float, default=0.01,
-                                help="diferenca maxima para o top-1 (default 0.01)")
+                                     "dos ate --soup-k melhores checkpoints, "
+                                     "opcionalmente limitados por --soup-window "
+                                     "e --soup-tol. Publica soup_val_pearsonr "
+                                     "ao lado de best_val_pearsonr. Exclusiva "
+                                     "com --topk-avg.")
+    trainer_parser.add_argument("--soup-k", type=int, default=None,
+                                help="OBRIGATORIO com --soup: tamanho maximo da "
+                                     "sopa. Sem default de proposito -- quantos "
+                                     "pesos entram na media e a decisao que nao "
+                                     "deve ser tomada em silencio.")
+    trainer_parser.add_argument("--soup-window", type=int, default=None,
+                                help="opcional: so mistura checkpoints a menos "
+                                     "de N epocas do melhor. Omitido, nao ha "
+                                     "guarda de bacia -- e foi sem ela que um "
+                                     "run juntou as epocas 2, 5, 9, 12 e 47 e "
+                                     "perdeu 0.1342.")
+    trainer_parser.add_argument("--soup-tol", type=float, default=None,
+                                help="opcional: diferenca maxima para o top-1. "
+                                     "Omitido, o tamanho e decidido so por "
+                                     "--soup-k.")
     trainer_parser.add_argument("--soup-tol-mode", choices=("abs", "rel"),
-                                default="abs",
-                                help="--soup-tol em unidades da metrica (abs) ou "
-                                     "como fracao do top-1 (rel). Nao sao "
-                                     "intercambiaveis: para val_pearsonr ~0.62, "
-                                     "rel 0.05 vale abs 0.031.")
+                                default=None,
+                                help="unidade de --soup-tol: 'abs' na escala da "
+                                     "metrica (default quando --soup-tol e "
+                                     "dado) ou 'rel' como fracao do top-1. Nao "
+                                     "sao intercambiaveis: para val_pearsonr "
+                                     "~0.62, rel 0.05 vale abs 0.031.")
     trainer_parser.add_argument("--soup-pool", type=int, default=0,
-                                help="quantos checkpoints manter em disco "
-                                     "(0 = usa --soup-k). Um pool maior que K da "
-                                     "a janela candidatos para repor, em vez de "
-                                     "so encolher a sopa.")
+                                help="opcional: quantos checkpoints manter em "
+                                     "disco (0 = usa --soup-k). Um pool maior "
+                                     "que K da a janela candidatos para repor, "
+                                     "em vez de so encolher a sopa.")
     trainer_parser.add_argument("--topk-pool", type=int, default=0,
                                 help="quantos checkpoints manter em disco para "
                                      "as receitas de sopa (0 = usa --topk-avg)")
