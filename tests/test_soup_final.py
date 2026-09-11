@@ -118,7 +118,7 @@ def rodar(monkeypatch, log, **flags):
     monkeypatch.setattr(train, "_metricas_da_sopa",
                         lambda *a, **k: dict(log) if log else None)
     _avaliar_sopa_final(None, model, None, POOL, BEST, args)
-    return getattr(model, "_topk_avg_metrics", {})
+    return getattr(model, "_soup_metrics", {})
 
 
 LOG = {"val_pearsonr": 0.6420, "val_loss": 0.95,

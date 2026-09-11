@@ -46,11 +46,6 @@ def run(args):
         print("[sopa] AVISO: sem --soup-window nao ha guarda de bacia. Medido: "
               "um run juntou as epocas 2, 5, 9, 12 e 47 e perdeu 0.1342 de "
               "val_pearsonr.", flush=True)
-    if args.soup and args.topk_avg > 1:
-        sys.exit("--soup e --topk-avg sao exclusivos: o primeiro e a receita "
-                 "final, o segundo e a grade experimental v3-v6 que a "
-                 "originou. Rodar os dois deixaria ambiguo qual conjunto de "
-                 "pesos as metricas soup_* descrevem.")
     torch.set_float32_matmul_precision("medium")
     dotenv.load_dotenv()
 
@@ -60,9 +55,8 @@ def run(args):
         args.early_stop_patience, args.val_monitor,
         early_stop_warmup=args.early_stop_warmup,
         sema=args.sema, sema_decay=args.sema_decay,
-        ema=args.ema, ema_decay=args.ema_decay, topk_avg=args.topk_avg,
-        topk_pool=args.topk_pool, soup=args.soup, soup_k=args.soup_k,
-        soup_pool=args.soup_pool)
+        ema=args.ema, ema_decay=args.ema_decay, soup=args.soup,
+        soup_k=args.soup_k, soup_pool=args.soup_pool)
     logger = configure_logger(args)
     track_files(logger)
 
@@ -96,13 +90,13 @@ def run(args):
     # Snapshot dos K melhores AGORA, antes do trainer.test abaixo. O test roda
     # com ckpt_path="best", e carregar um checkpoint restaura o estado dos
     # callbacks gravado DENTRO dele -- o que rebobina `best_k_models` para o
-    # que era quando aquela epoca foi salva. Medido: `topk_avg_k` saia igual a
+    # que era quando aquela epoca foi salva. Medido: o k da sopa saia igual a
     # posicao cronologica do melhor checkpoint (2 ou 3), nunca 5.
     # O pool inteiro, COM os scores: cada receita de sopa filtra e escolhe de
     # um jeito, entao filtrar aqui perderia informacao que uma delas precisa.
-    topk_pool = {p: float(v) for p, v in ckpt_cb.best_k_models.items()
-                 if os.path.exists(p)}
-    topk_best = ckpt_cb.best_model_path
+    pool_ckpts = {p: float(v) for p, v in ckpt_cb.best_k_models.items()
+                  if os.path.exists(p)}
+    melhor_ckpt = ckpt_cb.best_model_path
     for tag, path in (("last", ckpt_cb.last_model_path), ("best", ckpt_cb.best_model_path)):
         if path:
             # Contrato do worker do broker (agent.py::_parse_ckpt_path): a pausa
@@ -130,16 +124,15 @@ def run(args):
         # Congela as metricas de test AGORA. `trainer.callback_metrics` e
         # zerado no inicio de cada estagio, e _avaliar_sopas abaixo roda um
         # trainer.validate() -- que apagava todo `test_*` do dicionario. Efeito
-        # medido no refit: os runs com --topk-avg entregaram sopa OU
+        # medido no refit: os runs com sopa ligada entregaram sopa OU
         # test_pearsonr, nunca os dois, conforme a sopa tivesse rodado ou nao.
         model._test_metrics = {k: float(v) for k, v in
                                trainer.callback_metrics.items()
                                if k.startswith("test_")}
 
     if args.soup:
-        _avaliar_sopa_final(trainer, model, data_module, topk_pool, topk_best, args)
-    elif args.topk_avg > 1:
-        _avaliar_sopas(trainer, model, data_module, topk_pool, topk_best, args)
+        _avaliar_sopa_final(trainer, model, data_module, pool_ckpts, melhor_ckpt,
+                            args)
 
     emit_metrics_line(trainer, model, args)
 
@@ -262,46 +255,10 @@ def _avaliar_sopa_final(trainer, model, data_module, pool: dict, best_path: str,
                 metricas[f"soup_{st}_{chave}"] = r[f"{st}_{chave}"]
     # Mesmo canal de transporte da grade experimental: `emit_metrics_line` le
     # este atributo. So o conteudo muda.
-    model._topk_avg_metrics = metricas
+    model._soup_metrics = metricas
     print(f"[sopa] final: k={len(paths)} epocas={sorted(eps)} "
           f"span={metricas['soup_epoch_span']:.0f} "
           f"val_pearsonr={r['val_pearsonr']:.4f}", flush=True)
-
-def _receitas(pool: dict, best_path: str, args) -> dict:
-    """As receitas de sopa, todas sobre o MESMO treino e o mesmo pool.
-
-    Elas se distinguem por DUAS decisoes independentes -- o que entra na
-    janela, e como escolher dentro dela:
-
-      v3  os `topk_avg` melhores do pool inteiro, depois filtrados pela janela.
-          Reproduz o comportamento anterior; quando o pool tem exatamente
-          `topk_avg` checkpoints, e literalmente ele.
-      v4  a janela primeiro, os `topk_avg` melhores depois. Com um pool maior
-          que `topk_avg`, ainda consegue juntar K vizinhos quando a v3 ficaria
-          com menos.
-      v5  na janela, todos os que estao a menos de `topk_rel_tol` do top-1, em
-          termos RELATIVOS. O tamanho da sopa passa a ser lido dos dados: um
-          plato largo junta muitos, um pico isolado junta poucos.
-      v6  igual a v5, com tolerancia ABSOLUTA. Para um score que vive perto de
-          0.62, uma fracao e um valor fixo nao sao a mesma coisa, e qual dos
-          dois descreve melhor "epocas equivalentes" e o que se quer medir.
-    """
-    ordenado_global = sorted(pool.items(), key=lambda kv: -kv[1])
-    dentro = _na_janela(pool, best_path, args.topk_window)
-    ordenado = sorted(dentro.items(), key=lambda kv: -kv[1])
-    receitas = {}
-
-    v3 = _na_janela(dict(ordenado_global[:args.topk_avg]), best_path,
-                    args.topk_window)
-    receitas["v3"] = list(v3)
-    receitas["v4"] = [p for p, _ in ordenado[:args.topk_avg]]
-    if ordenado:
-        top1 = ordenado[0][1]
-        receitas["v5"] = [p for p, v in ordenado
-                          if v >= top1 - abs(top1) * args.topk_rel_tol]
-        receitas["v6"] = [p for p, v in ordenado if v >= top1 - args.topk_abs_tol]
-    return receitas
-
 
 def _metricas_da_sopa(trainer, model, data_module, paths: list[str]):
     """Media os pesos, valida, e devolve o log INTEIRO da validacao. None se nao der.
@@ -325,80 +282,6 @@ def _metricas_da_sopa(trainer, model, data_module, paths: list[str]):
     if not extras:
         return None
     return {k: float(v) for k, v in extras[-1].items()}
-
-
-def _avaliar_sopas(trainer, model, data_module, pool: dict, best_path: str,
-                   args) -> None:
-    """Avalia todas as receitas no mesmo run, uma validacao por conjunto DISTINTO.
-
-    Receitas diferentes frequentemente selecionam o mesmo conjunto de
-    checkpoints; validar de novo custaria uma passada inteira pela validacao
-    para reproduzir um numero ja conhecido. O cache por conjunto e o que torna
-    viavel medir quatro receitas pelo preco de um treino.
-    """
-    if len(pool) < 2:
-        print(f"[sopa] pool com {len(pool)} checkpoint(s); pulando", flush=True)
-        return
-    receitas = _receitas(pool, best_path, args)
-    metricas, cache = {}, {}
-    for nome, paths in receitas.items():
-        paths = sorted(set(paths))
-        if len(paths) < 2:
-            print(f"[sopa] {nome}: so {len(paths)} checkpoint(s) elegivel(is); "
-                  "pulando", flush=True)
-            continue
-        chave = tuple(paths)
-        if chave not in cache:
-            cache[chave] = _metricas_da_sopa(trainer, model, data_module, paths)
-        r = cache[chave]
-        if r is None:
-            print(f"[sopa] {nome}: validacao nao produziu log; pulando", flush=True)
-            continue
-        pearson, loss = r["val_pearsonr"], r["val_loss"]
-        eps = [e for e in map(_epoca_do_ckpt, paths) if e is not None]
-        metricas[f"soup_{nome}_val_pearsonr"] = pearson
-        metricas[f"soup_{nome}_val_loss"] = loss
-        # Estratos da sopa, quando o split os tem. Mesma regra do
-        # `emit_metrics_line`: ausencia nao vira zero, a chave simplesmente nao
-        # sai -- um estrato com menos de MIN_STRATUM_N pontos nao e logado, e um
-        # split sem coluna de estrato nao produz nenhum.
-        for st in ("val_in", "val_ood"):
-            for k in ("pearsonr", "n"):
-                if f"{st}_{k}" in r:
-                    metricas[f"soup_{nome}_{st}_{k}"] = r[f"{st}_{k}"]
-        metricas[f"soup_{nome}_k"] = float(len(paths))
-        metricas[f"soup_{nome}_epoch_span"] = float(max(eps) - min(eps)) if eps else -1.0
-        print(f"[sopa] {nome}: k={len(paths)} epocas={sorted(eps)} "
-              f"val_pearsonr={pearson:.4f}", flush=True)
-
-    # A v3 continua publicada com os nomes antigos: as ferramentas de analise
-    # ja construidas leem `topk_avg_*`, e renomea-las quebraria a comparacao
-    # com os bracos topk-test, v2 e v3 ja medidos.
-    for sufixo in ("val_pearsonr", "val_loss", "k", "epoch_span",
-                   "val_in_pearsonr", "val_in_n", "val_ood_pearsonr", "val_ood_n"):
-        if f"soup_v3_{sufixo}" in metricas:
-            alvo = "topk_avg_" + ("epoch_span" if sufixo == "epoch_span" else sufixo)
-            metricas[alvo] = metricas[f"soup_v3_{sufixo}"]
-    metricas["soup_pool"] = float(len(pool))
-    model._topk_avg_metrics = metricas
-
-
-def _load_best_score(ckpt_path: str):
-    """val_pearsonr do melhor checkpoint lido do estado do ModelCheckpoint
-    gravado no arquivo (ckpt['callbacks']). None se nao for possivel ler.
-
-    Em Lightning >= 2.x, ckpt['callbacks'] e um dict {repr(callback): state};
-    em versoes antigas, uma lista de states. Os dois formatos sao aceitos."""
-    try:
-        cbs = torch.load(ckpt_path, map_location="cpu",
-                         weights_only=False).get("callbacks")
-        states = list(cbs.values()) if isinstance(cbs, dict) else (cbs or [])
-        for cb_state in states:
-            if isinstance(cb_state, dict) and cb_state.get("best_model_score") is not None:
-                return float(cb_state["best_model_score"])
-    except Exception:
-        return None
-    return None
 
 
 def emit_metrics_line(trainer, model, args) -> None:
@@ -465,8 +348,8 @@ def emit_metrics_line(trainer, model, args) -> None:
                   if k.startswith("test_")}
     metrics.update(testes)
 
-    # media dos K melhores checkpoints (--topk-avg), quando houver
-    metrics.update(getattr(model, "_topk_avg_metrics", {}))
+    # a sopa de pesos (--soup), quando houver
+    metrics.update(getattr(model, "_soup_metrics", {}))
 
     print(json.dumps({"experiment": args.experiment, "seed": args.seed,
                       "metrics": metrics}), flush=True)
@@ -680,20 +563,18 @@ def average_state_dicts(paths: list[str]) -> dict:
 def configure_callbacks(early_stop_patience: int = 0, val_monitor: str = "val_pearsonr",
                         early_stop_warmup: int = 0, sema: bool = False,
                         sema_decay: float = 0.999, ema: bool = False,
-                        ema_decay: float = 0.99, topk_avg: int = 1,
-                        topk_pool: int = 0, soup: bool = False,
+                        ema_decay: float = 0.99, soup: bool = False,
                         soup_k: int | None = None, soup_pool: int = 0):
     monitor, mode = val_monitor, "max"
     callbacks = [
         # save_last: essencial p/ o pause/migracao do broker — sem ele so o
         # "best" e guardado e o resume voltaria ate o melhor epoch (nao ao ultimo).
-        # save_top_k: >1 so com --topk-avg, que precisa dos K melhores em disco.
-        # Com --topk-pool o disco guarda MAIS que K: as receitas que filtram
-        # por janela antes de escolher precisam de candidatos sobrando, senao
-        # o filtro so consegue encolher a sopa, nunca trocar seus membros.
+        # save_top_k: >1 so com --soup, que precisa dos candidatos em disco.
+        # Com --soup-pool o disco guarda MAIS que K: a janela e a tolerancia
+        # filtram antes de escolher, e sem candidatos sobrando elas so
+        # conseguem encolher a sopa, nunca trocar seus membros.
         ModelCheckpoint(monitor=monitor, mode=mode,
-                        save_top_k=(max(1, soup_pool or soup_k or 1) if soup
-                                    else max(1, topk_pool or topk_avg)),
+                        save_top_k=max(1, soup_pool or soup_k or 1) if soup else 1,
                         save_last=True),
     ]
     if sema:
@@ -779,8 +660,7 @@ def get_parser():
                                      "dos ate --soup-k melhores checkpoints, "
                                      "opcionalmente limitados por --soup-window "
                                      "e --soup-tol. Publica soup_val_pearsonr "
-                                     "ao lado de best_val_pearsonr. Exclusiva "
-                                     "com --topk-avg.")
+                                     "ao lado de best_val_pearsonr.")
     trainer_parser.add_argument("--soup-k", type=int, default=None,
                                 help="OBRIGATORIO com --soup: tamanho maximo da "
                                      "sopa. Sem default de proposito -- quantos "
@@ -808,22 +688,6 @@ def get_parser():
                                      "disco (0 = usa --soup-k). Um pool maior "
                                      "que K da a janela candidatos para repor, "
                                      "em vez de so encolher a sopa.")
-    trainer_parser.add_argument("--topk-pool", type=int, default=0,
-                                help="quantos checkpoints manter em disco para "
-                                     "as receitas de sopa (0 = usa --topk-avg)")
-    trainer_parser.add_argument("--topk-rel-tol", type=float, default=0.05,
-                                help="receita v5: fracao do top-1 abaixo da "
-                                     "qual o checkpoint ainda entra na sopa")
-    trainer_parser.add_argument("--topk-abs-tol", type=float, default=0.01,
-                                help="receita v6: idem, em valor absoluto")
-    trainer_parser.add_argument("--topk-window", type=int, default=0,
-                                help="so mistura checkpoints a menos de N "
-                                     "epocas do melhor (0 = sem janela)")
-    trainer_parser.add_argument("--topk-avg", type=int, default=1,
-                                help="media dos pesos dos K melhores checkpoints "
-                                     "(model soup). K>1 faz o ModelCheckpoint guardar "
-                                     "K arquivos e publica topk_avg_val_pearsonr ao "
-                                     "lado de best_val_pearsonr.")
     trainer_parser.add_argument("--val-monitor", type=str, default="val_pearsonr",
                                 help="Metric to monitor for ModelCheckpoint and EarlyStopping.")
     # resume (broker pause/migracao): o worker injeta esses argumentos quando
