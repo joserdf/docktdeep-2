@@ -19,6 +19,10 @@ EPOCA = {
     "val_in_pearsonr": 0.73, "val_in_n": 187.0,
     "val_ood_pearsonr": 0.58, "val_ood_n": 402.0,
     "train_loss": 0.88, "test_casf_pearsonr": 0.70,
+    # internos de treino: componentes da perda e normas de gradiente
+    "train_semi": 0.21, "train_rdrop": 0.05,
+    "train_yaw_lig": 0.31, "train_yaw_lig_rows": 0.84,
+    "train_grad_cnn": 1.7, "train_grad_prot": 0.4,
     "epoch": 7,
 }
 
@@ -76,3 +80,32 @@ def test_valores_chegam_intactos(series):
     v = {(n, c): val for n, c, val, *_ in series}
     assert v[("pearsonr", (("stratum", "ood"), ("subset", "val")))] == 0.58
     assert v[("n", (("stratum", "in"), ("subset", "val")))] == 187.0
+
+
+def test_perdas_auxiliares_sob_um_nome(series):
+    """Quatro series de `train_*` viram duas quantidades, separadas por eixo."""
+    por_nome = {}
+    for n, c, *_ in series:
+        por_nome.setdefault(n, set()).add(c)
+    assert por_nome["aux_loss"] == {
+        (("subset", "train"), ("term", "semi")),
+        (("subset", "train"), ("term", "rdrop")),
+        (("family", "yaware"), ("subset", "train"), ("term", "lig")),
+    }
+    assert por_nome["aux_rows"] == {
+        (("family", "yaware"), ("subset", "train"), ("term", "lig")),
+    }
+
+
+def test_gradientes_sob_um_nome(series):
+    """`grad_cnn` e `grad_prot` eram dois nomes para uma norma so."""
+    ctxs = {c for n, c, *_ in series if n == "grad_norm"}
+    assert ctxs == {(("branch", "cnn"), ("subset", "train")),
+                    (("branch", "prot"), ("subset", "train"))}
+
+
+def test_internos_nao_ganham_estrato(series):
+    """Um `stratum: all` num componente da perda sugeriria um `ood` irmao."""
+    for n, c, *_ in series:
+        if n in ("aux_loss", "aux_rows", "grad_norm"):
+            assert "stratum" not in dict(c)
