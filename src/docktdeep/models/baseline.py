@@ -13,6 +13,7 @@ from torchmetrics.functional.regression import (
 )
 from torchmetrics.regression import MeanAbsoluteError
 
+from ..aim_naming import nome_e_contexto
 from . import losses
 from .cnn import build_voxel_encoder
 from .embeddings import E_LIG_DIM, build_embedding_projection, esm2_dim
@@ -809,15 +810,18 @@ class Baseline(pl.LightningModule):
         best_loss = min(self.validation_logs, key=lambda x: x["val_loss"])
         best_mae = min(self.validation_logs, key=lambda x: x["val_mae"])
 
-        self.logger.experiment.track(
-            {
-                "best_val_pearsonr": best_pearsonr["val_pearsonr"],
-                "best_val_loss": best_loss["val_loss"],
-                "best_val_mae": best_mae["val_mae"],
-                "val_mae_at_best_loss": best_loss["val_mae"],
-            },
-            context={"subset": "val"},
-        )
+        # Chaves com o prefixo do subset, iguais as do log_dict, para que
+        # `nome_e_contexto` as traduza pela MESMA regra: o `val` ia junto no
+        # nome E no contexto, e `best_val_pearsonr` era mais um nome para uma
+        # quantidade que ja existe como `pearsonr`.
+        for chave, valor in (
+            ("val_best_pearsonr", best_pearsonr["val_pearsonr"]),
+            ("val_best_loss", best_loss["val_loss"]),
+            ("val_best_mae", best_mae["val_mae"]),
+            ("val_mae_at_best_loss", best_loss["val_mae"]),
+        ):
+            nome, contexto = nome_e_contexto(chave)
+            self.logger.experiment.track(valor, name=nome, context=contexto)
 
     def on_test_epoch_end(self) -> None:
         out = self.test_step_outputs

@@ -4,6 +4,7 @@ import lightning.pytorch as pl
 import torch
 import torch.nn.functional as F
 
+from ..aim_naming import nome_e_contexto
 from .blocks import ConvGroupDepthwise
 
 __all__ = ["STN"]
@@ -207,13 +208,10 @@ class STN(pl.LightningModule):
         best_pearsonr = max(self.validation_logs, key=lambda x: x["val_pearsonr"])
         best_loss = min(self.validation_logs, key=lambda x: x["val_loss"])
 
-        self.logger.experiment.track(
-            {
-                "best_val_pearsonr": best_pearsonr["val_pearsonr"],
-                "best_val_loss": best_loss["val_loss"],
-            },
-            context={"subset": "val"},
-        )
+        for chave, valor in (("val_best_pearsonr", best_pearsonr["val_pearsonr"]),
+                             ("val_best_loss", best_loss["val_loss"])):
+            nome, contexto = nome_e_contexto(chave)
+            self.logger.experiment.track(valor, name=nome, context=contexto)
 
     def on_test_epoch_end(self) -> None:
         out = self.test_step_outputs

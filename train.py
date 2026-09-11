@@ -15,6 +15,7 @@ import torch
 from aim.pytorch_lightning import AimLogger
 from docktgrid.view import BasicView, VolumeView
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.utilities import rank_zero_only
 from torch.optim.swa_utils import AveragedModel, get_ema_avg_fn
 
 from src.docktgrid_2.NewViewComplex import NewViewComplex
@@ -25,6 +26,7 @@ from src.docktgrid_2.VolumeViewComplex import VolumeViewComplex
 from src.docktgrid_2.VolumeViewLigProt import VolumeViewLigProt
 from src.docktgrid_2.CustomVoxelGrid import CustomVoxelGrid
 
+from src.docktdeep.aim_naming import nome_e_contexto
 from src.docktdeep.dataset import PDBbind
 from src.docktdeep.models import *
 from src.docktdeep.transforms import MolecularDropout, Random90DegreesRotation
@@ -367,8 +369,28 @@ def configure_voxel_grid(args):
     )
 
 
+class LoggerComContexto(AimLogger):
+    """AimLogger que poe o estrato no contexto, e nao no nome da metrica.
+
+    O AimLogger de fabrica so conhece o prefixo do subset: ele manda
+    `val_pearsonr` para `pearsonr` em {'subset': 'val'}, mas manda
+    `val_ood_pearsonr` para `ood_pearsonr` -- um NOME novo para a mesma
+    quantidade, que nenhum grafico consegue sobrepor ao pooled. Ver
+    `src.docktdeep.aim_naming`.
+    """
+
+    @rank_zero_only
+    def log_metrics(self, metrics: dict, step: int | None = None) -> None:
+        restantes = dict(metrics)
+        epoch = restantes.pop("epoch", None)
+        for chave, valor in restantes.items():
+            nome, contexto = nome_e_contexto(chave)
+            self.experiment.track(valor, name=nome, step=step, epoch=epoch,
+                                  context=contexto)
+
+
 def configure_logger(args):
-    logger = AimLogger(
+    logger = LoggerComContexto(
         repo=os.environ.get("AIM_REPO") if args.remote else None,
         experiment=args.experiment,
         log_system_params=False,
