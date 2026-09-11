@@ -137,8 +137,50 @@ def run(args):
                             args)
 
     emit_metrics_line(trainer, model, args)
+    # Depois da linha de metricas, nunca antes: a poda so pode acontecer quando
+    # tudo que le checkpoint (test, sopa) ja rodou.
+    podar_ckpts(ckpt_cb, melhor_ckpt, args.keep_ckpts)
 
     return trainer
+
+
+def podar_ckpts(ckpt_cb, melhor: str, modo: str) -> None:
+    """Apaga os checkpoints do run conforme --keep-ckpts. 'all' nao mexe em nada.
+
+    Uma busca com `--soup` guarda K checkpoints por trial (K vai a 16 na grade
+    da campanha 4) e nada os removia no fim. Foi assim que o /home do
+    diamante-02 chegou a 100 GB em 531 checkpoints e matou 201 tarefas com
+    ENOSPC no meio da geracao 0. O disco de um worker nao aguenta uma campanha
+    inteira nem guardando UM checkpoint por trial: o custo e da ordem de
+    1-4 GB por run, vezes centenas de runs por worker.
+
+    Por isso os tres niveis. 'best' guarda so o vencedor -- e o modo para runs
+    que alguem vai querer reavaliar (refit, hold-out). 'none' nao guarda nada,
+    e e o modo da BUSCA: o que a busca produz ja esta no metrics_json, e o
+    ponto vencedor e re-treinado no refit de qualquer forma.
+    """
+    if modo == "all":
+        return
+    dirpath = getattr(ckpt_cb, "dirpath", None)
+    if not dirpath or not os.path.isdir(dirpath):
+        return
+    manter = {os.path.abspath(melhor)} if (melhor and modo == "best") else set()
+    n, libertos = 0, 0
+    for nome in os.listdir(dirpath):
+        if not nome.endswith(".ckpt"):
+            continue
+        alvo = os.path.abspath(os.path.join(dirpath, nome))
+        if alvo in manter:
+            continue
+        try:
+            libertos += os.path.getsize(alvo)
+            os.remove(alvo)
+            n += 1
+        except OSError as e:  # noqa: PERF203
+            # disco cheio ou permissao: a poda existe para o proximo run, e
+            # derrubar um run que ja entregou metrica seria o oposto disso
+            print(f"[ckpt] falha ao podar {alvo}: {e}", flush=True)
+    print(f"[ckpt] poda ({modo}): {n} arquivos, {libertos / 1e9:.2f} GB", flush=True)
 
 
 def _epoca_do_ckpt(path: str) -> int | None:
@@ -710,6 +752,14 @@ def get_parser():
                                      "disco (0 = usa --soup-k). Um pool maior "
                                      "que K da a janela candidatos para repor, "
                                      "em vez de so encolher a sopa.")
+    trainer_parser.add_argument("--keep-ckpts", choices=("all", "best", "none"),
+                                default="all",
+                                help="o que sobra em disco no fim do run. "
+                                     "'all' (default) preserva o comportamento "
+                                     "historico; 'best' guarda so o vencedor; "
+                                     "'none' e o modo da busca -- as metricas "
+                                     "ja sairam no metrics_json e o vencedor e "
+                                     "re-treinado no refit.")
     trainer_parser.add_argument("--val-monitor", type=str, default="val_pearsonr",
                                 help="Metric to monitor for ModelCheckpoint and EarlyStopping.")
     # resume (broker pause/migracao): o worker injeta esses argumentos quando
