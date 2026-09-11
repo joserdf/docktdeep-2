@@ -29,6 +29,20 @@ __all__ = ["Baseline"]
 MIN_STRATUM_N = 10
 
 
+def _chave_estrato(stage: str, st: str) -> str:
+    """Nome da metrica de um estrato, sem duplicar o prefixo do split.
+
+    As duas colunas de estrato do dataset nomeiam seus valores de formas
+    diferentes: `grp_stratum` traz "ood"/"casf"/"dev" (cru, precisa do prefixo)
+    e `grp_mixval_stratum_o<N>` traz "val_in"/"val_ood" (ja prefixado, porque a
+    mesma coluna tambem marca o estrato do teste). Concatenar sem verificar
+    produzia `val_val_in_pearsonr`, chave que nenhum leitor procura --
+    `emit_metrics_line` e `_avaliar_sopa_final` leem `val_in_pearsonr` -- e o
+    estrato sumia do metrics_json sem erro algum.
+    """
+    return st if st.startswith(f"{stage}_") else f"{stage}_{st}"
+
+
 class Baseline(pl.LightningModule):
     """Regressor de afinidade sobre grade de voxels + embeddings congelados.
 
@@ -763,8 +777,9 @@ class Baseline(pl.LightningModule):
                     if mask.sum() >= MIN_STRATUM_N:
                         sub_p = preds[mask]
                         sub_l = labels[mask]
-                        sub_m = self._regression_metrics(sub_p, sub_l, f"val_{st}")
-                        sub_m[f"val_{st}_n"] = float(mask.sum())
+                        nome = _chave_estrato("val", str(st))
+                        sub_m = self._regression_metrics(sub_p, sub_l, nome)
+                        sub_m[f"{nome}_n"] = float(mask.sum())
                         log.update(sub_m)
 
         if bool(self.hparams.get("eval_test_per_epoch", False)) and dm is not None and hasattr(dm, "test_dataloader"):
@@ -793,15 +808,23 @@ class Baseline(pl.LightningModule):
                             if mask.sum() >= MIN_STRATUM_N:
                                 sub_p = t_preds[mask]
                                 sub_l = t_labels[mask]
-                                sub_m = self._regression_metrics(sub_p, sub_l, f"test_{st}")
-                                sub_m[f"test_{st}_n"] = float(mask.sum())
+                                nome = _chave_estrato("test", str(st))
+                                sub_m = self._regression_metrics(sub_p, sub_l, nome)
+                                sub_m[f"{nome}_n"] = float(mask.sum())
                                 log.update(sub_m)
             # sem isto o modelo seguiria em eval() no resto do treino (dropout
             # e batchnorm desligados) — fatal numa busca que tuna dropout
             self.train(was_training)
 
         self.log_dict(log, prog_bar=True, logger=True)
-        self.validation_logs.append(log)
+        # A sanity check valida 2 batches com pesos aleatorios: nao e uma epoca.
+        # Guardada aqui, ela disputa o argmax que define `best_val_pearsonr` e
+        # `best_val_loss` -- e, por ver so parte do split, nao casa com
+        # `val_strata` e portanto nao tem estrato nenhum. Quando ela ganhava o
+        # argmax, o run publicava best_val_pearsonr sem val_in/val_ood, e o
+        # numero vinha de um modelo nao treinado sobre uma fracao da validacao.
+        if not getattr(self.trainer, "sanity_checking", False):
+            self.validation_logs.append(log)
 
         self.validation_step_outputs.clear()
 
