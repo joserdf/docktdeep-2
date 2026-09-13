@@ -294,6 +294,9 @@ def similarity_terms_loss(
     targets: dict[str, torch.Tensor],
     tau: float,
     weight: float,
+    weights: dict[str, float] | None = None,
+    reg_loss: torch.Tensor | None = None,
+    auto_scale: bool = False,
 ) -> tuple[torch.Tensor, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
     """Soma ponderada de termos independentes sobre a mesma projecao `p`.
 
@@ -301,6 +304,20 @@ def similarity_terms_loss(
     com `L_k` a perda sem peso e `row_frac` a fracao de linhas do batch que tem
     ao menos um parceiro positivo naquele termo — a metrica que denuncia um
     termo morto antes de ele passar despercebido como zero saudavel.
+
+    `weights` da a cada termo o SEU peso; sem ele todos usam `weight`, que era o
+    unico regime ate aqui (D5: |K| termos x lambda_0). Peso por termo e o que
+    torna os quatro lambdas eixos de busca independentes: nenhum termo entra na
+    soma multiplicado pelo peso de outro, e desligar um e po-lo em zero — os
+    demais nao mudam de escala por causa disso.
+
+    `auto_scale` traz cada termo a magnitude de `reg_loss` ANTES do peso, que e
+    o que `--auto-scale-loss` sempre prometeu e so o caminho y-aware entregava
+    (ver wiki/91-pitfalls.md: o ramo `dual` e os termos prot/lig eram os tres
+    unicos pontos de chamada). Ligado, `lambda_k` passa a significar "tamanho
+    deste termo em unidades de L_reg"; desligado, cada termo entra com a propria
+    magnitude. Os 45 runs de `submit_simab.py` rodaram no segundo regime, que
+    hoje se pede por `--no-auto-scale-loss`.
     """
     total = torch.zeros((), device=p.device)
     per_term = {}
@@ -308,5 +325,6 @@ def similarity_terms_loss(
         row_frac = row_fraction(tgt)
         Lk = soft_infonce(p, tgt, tau)
         per_term[name] = (Lk, row_frac)
-        total = total + Lk
-    return weight * total, per_term
+        w = weight if weights is None else float(weights.get(name, weight))
+        total = total + w * balance_scale(Lk, reg_loss, auto_scale)
+    return total, per_term

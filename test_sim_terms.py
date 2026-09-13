@@ -154,19 +154,164 @@ def test_sim_terms_loss(model):
     p, y, ifp, prot_idx, lig_idx, _ = synthetic_inputs(model)
     total, per = model._sim_terms_loss(p, prot_idx, lig_idx, ifp, y)
     check("sim_terms_loss returns 4 per-term entries", set(per) == {"ifp", "aff", "prot", "lig"})
-    # weighted total = sum of lambda * L_k
-    expected = sum(model._sim_infonce(p, t) for t in
-                   [model._ifp_target(ifp), model._aff_target(y),
-                    model._prot_target(prot_idx), model._lig_target(lig_idx)])
-    check("weighted total == sim_lambda * sum(L_k)",
-          abs(total.item() - model.sim_lambda * expected.item()) < 1e-5,
-          f"(got {total.item():.6f})")
     # row_frac in [0,1]
     for k, (Lk, rf) in per.items():
         check(f"row_frac {k} in [0,1]", 0.0 <= rf.item() <= 1.0 + 1e-6, f"(rf={rf.item():.3f})")
 
 
+def test_shared_weight_unscaled():
+    """O regime da ablacao D5: um peso so, sem rebalanceamento.
+
+    Ele deixou de ser o default quando --sim-terms passou a honrar
+    --auto-scale-loss (cujo default e True desde sempre); hoje se pede por
+    --no-auto-scale-loss, e a conta tem de bater exatamente como batia.
+    """
+    model, _ = make_model(["ifp", "aff", "prot", "lig"], auto_scale_loss=False)
+    p, y, ifp, prot_idx, lig_idx, _ = synthetic_inputs(model)
+    total, _ = model._sim_terms_loss(p, prot_idx, lig_idx, ifp, y)
+    expected = sum(model._sim_infonce(p, t) for t in
+                   [model._ifp_target(ifp), model._aff_target(y),
+                    model._prot_target(prot_idx), model._lig_target(lig_idx)])
+    check("total == sim_lambda * sum(L_k) (peso unico, sem auto-scale)",
+          abs(total.item() - model.sim_lambda * expected.item()) < 1e-5,
+          f"(got {total.item():.6f})")
+
+
+def test_per_term_weights():
+    """Cada lambda pesa o SEU termo, e mexer num nao mexe nos outros.
+
+    E a propriedade que torna os quatro eixos independentes na busca: sem ela,
+    dobrar o peso do termo de afinidade dobrava os quatro.
+    """
+    pesos = dict(sim_lambda_ifp=0.01, sim_lambda_aff=0.02,
+                 sim_lambda_prot=0.03, sim_lambda_lig=0.04)
+    model, _ = make_model(["ifp", "aff", "prot", "lig"], auto_scale_loss=False,
+                          sim_lambda_max=1.0, **pesos)
+    p, y, ifp, prot_idx, lig_idx, _ = synthetic_inputs(model)
+    total, per = model._sim_terms_loss(p, prot_idx, lig_idx, ifp, y)
+    esperado = sum(pesos[f"sim_lambda_{k}"] * Lk.item() for k, (Lk, _) in per.items())
+    check("total == sum(lambda_k * L_k)", abs(total.item() - esperado) < 1e-6,
+          f"(got {total.item():.6f}, esperado {esperado:.6f})")
+
+    # desligar um termo (peso 0) nao muda a contribuicao dos outros tres
+    zerado, _ = make_model(["ifp", "aff", "prot", "lig"], auto_scale_loss=False,
+                           sim_lambda_max=1.0, **{**pesos, "sim_lambda_aff": 0.0})
+    t0, per0 = zerado._sim_terms_loss(p, prot_idx, lig_idx, ifp, y)
+    delta = pesos["sim_lambda_aff"] * per["aff"][0].item()
+    check("zerar um lambda tira exatamente o termo dele",
+          abs((total.item() - t0.item()) - delta) < 1e-6,
+          f"(diff {total.item() - t0.item():.6f} vs {delta:.6f})")
+
+    # um termo sem peso proprio cai no --sim-lambda, como os 45 runs da D5
+    misto, _ = make_model(["ifp", "aff"], auto_scale_loss=False,
+                          sim_lambda_ifp=0.05)
+    check("termo sem peso proprio usa --sim-lambda",
+          misto.sim_weight("aff") == misto.sim_lambda
+          and misto.sim_weight("ifp") == 0.05)
+
+
+def test_auto_scale_sim_terms():
+    """Com o rebalanceamento ligado, cada termo entra valendo lambda_k * L_reg.
+
+    E a diferenca que torna --auto-scale-loss um eixo com efeito neste caminho:
+    ele muda o que lambda_k SIGNIFICA (fracao de L_reg, e nao magnitude crua).
+    """
+    pesos = dict(sim_lambda_ifp=0.1, sim_lambda_aff=0.2)
+    model, _ = make_model(["ifp", "aff"], auto_scale_loss=True,
+                          sim_lambda_max=1.0, **pesos)
+    p, y, ifp, prot_idx, lig_idx, _ = synthetic_inputs(model)
+    reg = torch.tensor(3.0)
+    total, per = model._sim_terms_loss(p, prot_idx, lig_idx, ifp, y, reg_loss=reg)
+    esperado = (pesos["sim_lambda_ifp"] + pesos["sim_lambda_aff"]) * reg.item()
+    check("com auto-scale, total == sum(lambda_k) * L_reg",
+          abs(total.item() - esperado) < 1e-4,
+          f"(got {total.item():.6f}, esperado {esperado:.6f})")
+    cru, _ = model._sim_terms_loss(p, prot_idx, lig_idx, ifp, y, reg_loss=None)
+    check("sem reg_loss o auto-scale leva cada termo para magnitude 1",
+          abs(cru.item() - (pesos["sim_lambda_ifp"] + pesos["sim_lambda_aff"])) < 1e-4,
+          f"(got {cru.item():.6f})")
+
+
+def test_cosine_source():
+    """`--sim-emb-source cosine`: prot/lig voltam ao alvo do caminho y-aware.
+
+    O que precisa ser identico nao e "parecido": e o MESMO alvo e a MESMA perda
+    que `--lambda-prot`/`--lambda-lig` produziam sob `--yaware`. O que muda e so
+    quem soma -- la os termos entravam num total ja ancorado, aqui cada um e uma
+    parcela propria com o seu peso.
+    """
+    from docktdeep.models import losses
+
+    B, E = 8, 12
+    torch.manual_seed(3)
+    e_prot = torch.randn(B, E)
+    e_lig = torch.randn(B, E)
+    model, _ = make_model(["prot", "lig"], sim_emb_source="cosine",
+                          sim_mat_dir="",  # prova que nenhuma matriz e lida
+                          sim_lambda_prot=0.2, sim_lambda_lig=0.1,
+                          sim_lambda_max=1.0, auto_scale_loss=False)
+    check("sob cosine nenhuma matriz e carregada",
+          model.S_prot is None and model.S_lig is None)
+    p, y, ifp, prot_idx, lig_idx, _ = synthetic_inputs(model, B=B)
+    total, per = model._sim_terms_loss(p, prot_idx, lig_idx, ifp, y,
+                                       e_prot=e_prot, e_lig=e_lig)
+    for nome, e in (("prot", e_prot), ("lig", e_lig)):
+        esperado = losses.soft_infonce(p, losses.cosine_target(e), model.tau)
+        check(f"L_{nome} == InfoNCE(p, cosine_target(e_{nome}))",
+              torch.allclose(per[nome][0], esperado, atol=1e-6),
+              f"(got {per[nome][0].item():.6f}, esperado {esperado.item():.6f})")
+    esperado = 0.2 * per["prot"][0] + 0.1 * per["lig"][0]
+    check("o total continua sendo a soma pesada dos termos",
+          torch.allclose(total, esperado, atol=1e-6))
+
+    # os indices nao sao lidos: sob cosine eles chegam None vindos do collate
+    t2, _ = model._sim_terms_loss(p, None, None, ifp, y,
+                                  e_prot=e_prot, e_lig=e_lig)
+    check("sob cosine os indices da matriz nao sao usados",
+          torch.allclose(total, t2, atol=1e-6))
+
+    # embedding ausente e termo MORTO, e termo morto falha alto
+    try:
+        model._sim_terms_loss(p, prot_idx, lig_idx, ifp, y, e_prot=None,
+                              e_lig=e_lig)
+        check("embedding ausente sob cosine levanta", False, "(no exception)")
+    except ValueError as exc:
+        check("embedding ausente sob cosine levanta", "cosine" in str(exc))
+
+
+def test_cosine_pede_embedding_ao_dataloader():
+    """A regra do dataloader precisa casar com a do modelo.
+
+    `need_e_prot` olhava so `--lambda-prot`, que a decomposicao nao usa: sem
+    isto o termo nasceria morto exatamente nos bracos que nao ligam o ramo.
+    """
+    from docktdeep.dataset import PDBbind
+
+    dm = PDBbind(voxel_grid=None, batch_size=8, use_esm2=False, use_chemberta=False,
+                 semi=True, sim_terms=["prot", "lig"], sim_emb_source="cosine")
+    check("cosine pede e_prot mesmo com --use-esm2 off", dm.need_e_prot)
+    check("cosine pede e_lig mesmo com --use-chemberta off", dm.need_e_lig)
+    check("cosine nao abre mapa de matriz nenhum", not dm.need_sim_idx)
+
+    dm2 = PDBbind(voxel_grid=None, batch_size=8, use_esm2=False, use_chemberta=False,
+                  semi=True, sim_terms=["aff", "ifp"], sim_emb_source="matrix")
+    check("sem termo de matriz ativo, nenhum mapa e exigido", not dm2.need_sim_idx)
+
+    dm3 = PDBbind(voxel_grid=None, batch_size=8, use_esm2=False, use_chemberta=False,
+                  semi=True, sim_terms=["prot"], sim_emb_source="matrix")
+    check("sob matrix os indices continuam sendo montados", dm3.need_sim_idx)
+    check("sob matrix o embedding nao e pedido por causa do termo",
+          not dm3.need_e_prot)
+
+
 def test_failfast_budget():
+    # o orcamento soma os pesos REAIS: 0.025 (rdrop) + 0.3 + 3*0.025 > 0.125,
+    # mesmo com --sim-lambda dentro do limite.
+    try:
+        make_model(["ifp", "aff", "prot", "lig"], sim_lambda_aff=0.3)
+        check("budget conta o peso por termo", False, "(no exception)")
+    except ValueError:
+        check("budget conta o peso por termo", True)
     # within budget: 0.025 + 4*0.025 = 0.125 <= 0.125 -> ok
     make_model(["ifp", "aff", "prot", "lig"])
     # over budget: lambda_semi 0.1 + 4*0.025 = 0.2 > 0.125 -> raise
@@ -350,6 +495,11 @@ def main():
     test_bounds(model)
     test_zero_partner_row(model)
     test_sim_terms_loss(model)
+    test_shared_weight_unscaled()
+    test_per_term_weights()
+    test_auto_scale_sim_terms()
+    test_cosine_source()
+    test_cosine_pede_embedding_ao_dataloader()
     test_failfast_budget()
     test_failfast_flags()
     test_collate_7tuple()

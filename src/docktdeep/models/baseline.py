@@ -246,14 +246,38 @@ class Baseline(pl.LightningModule):
         # ~370 MB never enter a .ckpt, and row indices come from the datamodule.
         self.sim_terms = list(hp.get("sim_terms", []))
         self.sim_lambda = float(hp.get("sim_lambda", 0.025))
+        # Peso POR termo. None = "usa --sim-lambda", que era o unico regime da
+        # ablacao D5 (todos os termos com o mesmo lambda_0). Os quatro existem
+        # como flags separadas para que cada termo possa ser buscado sozinho:
+        # com um peso compartilhado, mudar um termo de tamanho mudava os outros
+        # tres junto, e nenhum dos quatro era um eixo independente.
+        self.sim_weights = {
+            k: (None if hp.get(f"sim_lambda_{k}") is None
+                else float(hp[f"sim_lambda_{k}"]))
+            for k in ("ifp", "aff", "prot", "lig")
+        }
         self.sim_lambda_max = float(hp.get("sim_lambda_max", 0.125))
         self.sim_kendall = bool(hp.get("sim_kendall", False))
         self.sim_mat_dir = str(hp.get("sim_mat_dir", ""))
+        # De onde vem o ALVO dos termos prot/lig. Sao duas nocoes de semelhanca
+        # diferentes, e nao duas implementacoes da mesma:
+        #   `matrix` -- PSI (identidade de sequencia) e Tanimoto de Morgan,
+        #               precalculados em S_prot.npz/S_lig.npz. E o que a ablacao
+        #               D5 rodou; fica como default para que aqueles runs sigam
+        #               reproduziveis pelo comando que os gerou.
+        #   `cosine` -- cosseno positivo entre os embeddings congelados do
+        #               proprio batch, exatamente o alvo que os termos
+        #               `--lambda-prot`/`--lambda-lig` do caminho y-aware sempre
+        #               usaram. Nao le matriz nenhuma, nao precisa de mapa, e
+        #               cobre 100% das amostras (o embedding e o que define a
+        #               amostra estar no split).
+        self.sim_emb_source = str(hp.get("sim_emb_source", "matrix"))
         self.S_prot = None
         self.S_lig = None
         if self.sim_terms:
             self._validate_sim_terms()
-            self._load_sim_matrices()
+            if self.sim_emb_source == "matrix":
+                self._load_sim_matrices()
 
     @property
     def rdrop_weight(self) -> float:
@@ -269,8 +293,17 @@ class Baseline(pl.LightningModule):
         alvos sao calculados, somam nada e o backward passa por eles a toa.
         Uma configuracao dessas e alcancavel pela busca, entao vale o teste.
         """
-        contrast_w = self.sim_lambda if self.sim_terms else self.lambda_semi
+        if self.sim_terms:
+            contrast_w = max((self.sim_weight(k) for k in self.sim_terms),
+                             default=0.0)
+        else:
+            contrast_w = self.lambda_semi
         return self.rdrop_weight != 0.0 or contrast_w != 0.0
+
+    def sim_weight(self, term: str) -> float:
+        """Peso com que `term` entra na soma: o proprio, ou --sim-lambda."""
+        w = self.sim_weights.get(term)
+        return self.sim_lambda if w is None else w
 
     def _validate_sim_terms(self) -> None:
         """Recusa combinacoes que produziriam um termo morto ou dominante."""
@@ -288,18 +321,31 @@ class Baseline(pl.LightningModule):
             raise ValueError(
                 f"--sim-terms is incompatible with --anchor-mode '{self.anchor_mode}': "
                 "keep the default 'affinity' (the anchor is unused in the decomposed path).")
+        if self.sim_emb_source not in ("matrix", "cosine"):
+            raise ValueError(
+                f"unknown --sim-emb-source '{self.sim_emb_source}': "
+                "use 'matrix' (S_prot.npz/S_lig.npz) ou 'cosine' (embeddings do batch).")
+        _emb = [k for k in ("prot", "lig") if k in self.sim_terms]
+        if _emb and self.sim_emb_source == "matrix" and not self.sim_mat_dir:
+            raise ValueError(
+                f"--sim-terms {' '.join(_emb)} sob --sim-emb-source matrix exige "
+                "--sim-mat-dir (S_prot.npz/S_lig.npz). Sob --sim-emb-source cosine "
+                "o alvo sai dos embeddings do batch e nenhuma matriz e lida.")
         if "ifp" in self.sim_terms and not self.hparams.get("ifp_path"):
             raise ValueError(
                 "--sim-terms ifp requires --ifp-path: without it every ifp slot is None and "
                 "L_ifp would be identically zero (a dead term) while the run looks healthy.")
         # non-dominance budget: the R-Drop weight + one lambda per term must
         # stay within the total block (D5: 5 x 0.025 = 0.125).
-        total = self.rdrop_weight + len(self.sim_terms) * self.sim_lambda
+        # Soma dos pesos REAIS, nao |K|*lambda_0: com peso por termo os dois
+        # deixaram de ser a mesma conta, e a versao antiga deixaria passar um
+        # bloco dominante desde que o lambda_0 fosse pequeno.
+        total = self.rdrop_weight + sum(self.sim_weight(k) for k in self.sim_terms)
         if total > self.sim_lambda_max + 1e-9:
             raise ValueError(
-                f"similarity budget {total:.3f} (rdrop_weight + |K|*sim_lambda) exceeds "
-                f"--sim-lambda-max {self.sim_lambda_max}; lower --sim-lambda, --lambda-semi "
-                f"or --lambda-rdrop.")
+                f"similarity budget {total:.3f} (rdrop_weight + sum of term weights) exceeds "
+                f"--sim-lambda-max {self.sim_lambda_max}; lower --sim-lambda(-<term>), "
+                f"--lambda-semi or --lambda-rdrop.")
 
     def _load_sim_matrices(self):
         """Load the precomputed similarity matrices as plain numpy arrays.
@@ -411,11 +457,28 @@ class Baseline(pl.LightningModule):
     def _ifp_target(self, ifp):
         return losses.ifp_target(ifp)
 
-    def _prot_target(self, prot_idx):
-        return losses.precomputed_target(prot_idx, self.S_prot)
+    def _emb_target(self, termo, idx, S, e):
+        """Alvo de um termo de embedding, na fonte escolhida (--sim-emb-source).
 
-    def _lig_target(self, lig_idx):
-        return losses.precomputed_target(lig_idx, self.S_lig)
+        Embedding ausente aqui nao e um termo fraco, e um termo MORTO: o alvo
+        sairia todo zero e o run seguiria com cara de saudavel. O dataloader ja
+        garante o vetor (`need_e_prot`/`need_e_lig` olham `sim_terms` quando a
+        fonte e `cosine`), entao chegar aqui com None significa que a regra de
+        la e a daqui sairam de sincronia -- e isso falha alto, nao em silencio.
+        """
+        if self.sim_emb_source == "cosine":
+            if e is None:
+                raise ValueError(
+                    f"--sim-terms {termo} sob --sim-emb-source cosine, mas o batch "
+                    f"nao trouxe e_{termo}: o termo seria identicamente zero.")
+            return losses.cosine_target(e)
+        return losses.precomputed_target(idx, S)
+
+    def _prot_target(self, prot_idx, e_prot=None):
+        return self._emb_target("prot", prot_idx, self.S_prot, e_prot)
+
+    def _lig_target(self, lig_idx, e_lig=None):
+        return self._emb_target("lig", lig_idx, self.S_lig, e_lig)
 
     def _yaware_infonce(self, p, y, ifp=None, x=None, e_prot=None, e_lig=None,
                         reg_loss=None, diag=None):
@@ -424,13 +487,14 @@ class Baseline(pl.LightningModule):
             e_prot=e_prot, e_lig=e_lig, reg_loss=reg_loss, diag=diag,
         )
 
-    def _similarity_targets(self, prot_idx, lig_idx, ifp, y) -> dict:
+    def _similarity_targets(self, prot_idx, lig_idx, ifp, y,
+                            e_prot=None, e_lig=None) -> dict:
         """Alvo de cada termo ativo, na ordem em que `--sim-terms` os declarou."""
         builders = {
             "ifp": lambda: self._ifp_target(ifp),
             "aff": lambda: self._aff_target(y),
-            "prot": lambda: self._prot_target(prot_idx),
-            "lig": lambda: self._lig_target(lig_idx),
+            "prot": lambda: self._prot_target(prot_idx, e_prot),
+            "lig": lambda: self._lig_target(lig_idx, e_lig),
         }
         targets = {}
         for k in self.sim_terms:
@@ -439,15 +503,21 @@ class Baseline(pl.LightningModule):
             targets[k] = builders[k]()
         return targets
 
-    def _sim_terms_loss(self, p, prot_idx, lig_idx, ifp, y):
+    def _sim_terms_loss(self, p, prot_idx, lig_idx, ifp, y, reg_loss=None,
+                        e_prot=None, e_lig=None):
         """Weighted sum of the active similarity terms over the shared projection p.
 
         Returns ``(weighted_total, per_term)`` where ``per_term[k] = (L_k, row_frac)``
         with ``L_k`` the unweighted loss and ``row_frac`` the fraction of batch rows
         that have at least one positive partner for that term.
         """
-        targets = self._similarity_targets(prot_idx, lig_idx, ifp, y)
-        return losses.similarity_terms_loss(p, targets, self.tau, self.sim_lambda)
+        targets = self._similarity_targets(prot_idx, lig_idx, ifp, y,
+                                           e_prot=e_prot, e_lig=e_lig)
+        return losses.similarity_terms_loss(
+            p, targets, self.tau, self.sim_lambda,
+            weights={k: self.sim_weight(k) for k in targets},
+            reg_loss=reg_loss, auto_scale=self.auto_scale_loss,
+        )
 
     def _semi_loss(self, z, x, e_prot, e_lig, y, ifp=None, prot_idx=None,
                    lig_idx=None, reg_loss=None, diag=None):
@@ -496,7 +566,9 @@ class Baseline(pl.LightningModule):
         rdrop = F.mse_loss(pa, pb)  # consistency between the two stochastic views
 
         if self.sim_terms:
-            return rdrop, self._sim_terms_loss(p, prot_idx, lig_idx, ifp, y)
+            return rdrop, self._sim_terms_loss(
+                p, prot_idx, lig_idx, ifp, y, reg_loss=reg_loss,
+                e_prot=e_prot, e_lig=e_lig)
 
         if self.yaware:
             return rdrop, self._yaware_infonce(
@@ -579,16 +651,26 @@ class Baseline(pl.LightningModule):
         parser.add_argument("--lambda-prot", type=float, default=0.0, help="Weight of ESM-2 protein embedding cosine contrastive term.")
         parser.add_argument("--lambda-lig", type=float, default=0.0, help="Weight of ChemBERTa ligand embedding cosine contrastive term.")
         parser.add_argument("--auto-scale-loss", action="store_true", default=True, help="Equalize magnitudes of loss terms via scale balancing before applying weights.")
+        # O off switch que faltava: ate aqui a flag era store_true/default=True,
+        # logo NAO havia como registrar um run sem o rebalanceamento -- todo run
+        # logava auto_scale_loss=true, tomasse ou nao o ramo (wiki/91-pitfalls).
+        parser.add_argument("--no-auto-scale-loss", dest="auto_scale_loss", action="store_false", help="Disable scale balancing: each loss term enters with its own magnitude.")
         parser.add_argument("--eval-test-per-epoch", action="store_true", default=False, help="Evaluate test set and log test_pearsonr, test_pearsonr_ood, test_pearsonr_casf at each epoch end.")
         parser.add_argument("--sim-terms", nargs="+", default=[],
                             choices=["ifp", "aff", "prot", "lig"],
                             help="Factor C decomposition: independent similarity terms, each an InfoNCE over the same projection p(f). Replaces the y-aware InfoNCE. Mutually exclusive with --yaware/--ifp-aware/non-default --anchor-mode.")
         parser.add_argument("--sim-lambda", type=float, default=0.025,
-                            help="Weight of each active similarity term (lambda_0 in the proposal).")
+                            help="Default weight of each active similarity term (lambda_0 in the proposal); a --sim-lambda-<term> overrides it for that term.")
+        for _t in ("ifp", "aff", "prot", "lig"):
+            parser.add_argument(f"--sim-lambda-{_t}", type=float, default=None,
+                                help=f"Weight of the '{_t}' similarity term. Falls back to --sim-lambda when absent, so old commands keep the shared-weight behaviour.")
         parser.add_argument("--sim-lambda-max", type=float, default=0.125,
                             help="Budget cap for the whole similarity block = lambda_semi + |K|*sim_lambda (D5: 5 x 0.025). With the default --lambda-semi 1.0 the budget always trips; set --lambda-semi 0.025 alongside --sim-terms.")
         parser.add_argument("--sim-mat-dir", type=str, default="",
-                            help="Dir with S_prot.npz / S_lig.npz (loaded as common attributes, not buffers).")
+                            help="Dir with S_prot.npz / S_lig.npz (loaded as common attributes, not buffers). Only read under --sim-emb-source matrix.")
+        parser.add_argument("--sim-emb-source", type=str, default="matrix",
+                            choices=["matrix", "cosine"],
+                            help="Target of the 'prot'/'lig' similarity terms: 'matrix' = precomputed PSI/Tanimoto (needs --sim-mat-dir and the two maps; the D5 ablation default), 'cosine' = positive cosine between the batch's frozen embeddings, the same target the y-aware --lambda-prot/--lambda-lig terms use.")
         parser.add_argument("--sim-kendall", action="store_true", default=False,
                             help="Use learned Kendall uncertainty weighting (phase-4.3 fallback). NOT implemented yet.")
         # fmt: on

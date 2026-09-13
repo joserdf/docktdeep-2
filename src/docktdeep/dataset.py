@@ -49,6 +49,7 @@ class PDBbind(pl.LightningDataModule):
         sim_mat_dir: str = "",  # dir with S_prot.npz / S_lig.npz (read only for the sentinel row index)
         sim_prot_map: str = "",  # json {complex_id: row} for S_prot
         sim_lig_map: str = "",  # json {complex_id: row} for S_lig
+        sim_emb_source: str = "matrix",  # alvo de prot/lig: matriz precalculada ou cosseno dos embeddings
         **kwargs,
     ):
         super().__init__()
@@ -78,9 +79,18 @@ class PDBbind(pl.LightningDataModule):
         # (--lambda-prot / --lambda-lig sob --semi). Sao usos independentes: o
         # termo de cosseno so precisa do vetor congelado para montar a matriz de
         # similaridade alvo, nunca o alimenta ao modelo.
+        # Sob `--sim-emb-source cosine` os termos `prot`/`lig` da decomposicao
+        # pedem o MESMO vetor congelado, so que por outra flag: o peso deles e
+        # `--sim-lambda-prot`, e nao `--lambda-prot`. Sem esta linha o termo
+        # nasceria morto justamente nos bracos que nao ligam o ramo (a3 sem
+        # ESM-2, a2 sem ChemBERTa), que sao os unicos em que ele nao seria
+        # redundante com o proprio ramo.
         contrastive = bool(semi)
-        self.need_e_prot = use_esm2 or (contrastive and float(lambda_prot) > 0.0)
-        self.need_e_lig = use_chemberta or (contrastive and float(lambda_lig) > 0.0)
+        sim_cos = bool(sim_terms) and sim_emb_source == "cosine"
+        self.need_e_prot = (use_esm2 or (contrastive and float(lambda_prot) > 0.0)
+                            or (sim_cos and "prot" in sim_terms))
+        self.need_e_lig = (use_chemberta or (contrastive and float(lambda_lig) > 0.0)
+                           or (sim_cos and "lig" in sim_terms))
 
         # So um vetor de proteina por amostra atravessa o batch. Com o ramo
         # ligado ele manda na escolha e o contrastivo reaproveita o mesmo; com o
@@ -103,6 +113,13 @@ class PDBbind(pl.LightningDataModule):
         self.sim_mat_dir = sim_mat_dir
         self.sim_prot_map = sim_prot_map
         self.sim_lig_map = sim_lig_map
+        self.sim_emb_source = sim_emb_source
+        # Os indices existem para endereçar as matrizes. Nenhum termo de matriz
+        # ativo => nenhum mapa a abrir: vale para `--sim-emb-source cosine` e
+        # tambem para um run so de `aff`/`ifp`, que antes exigia os dois json
+        # para nada.
+        self.need_sim_idx = (sim_emb_source == "matrix"
+                             and bool({"prot", "lig"} & set(sim_terms)))
         self._sim_maps = None  # (prot_map, lig_map) + sentinel rows, loaded lazily when sim_terms set
 
     @staticmethod
@@ -313,7 +330,7 @@ class PDBbind(pl.LightningDataModule):
         # to the shared all-zero sentinel row (zero-gradient, IFP convention).
         prot_idx = None
         lig_idx = None
-        if self.sim_terms:
+        if self.need_sim_idx:
             if self._sim_maps is None:
                 self._load_sim_maps()
             prot_map, lig_map = self._sim_maps
@@ -422,8 +439,17 @@ class PDBbind(pl.LightningDataModule):
             ifps = [torch.as_tensor(b[3], dtype=torch.uint8) if b[3] is not None
                     else torch.zeros(1 if ref is None else len(ref), dtype=torch.uint8)
                     for b in batch]
-            prot_idx = torch.stack([torch.as_tensor(b[4], dtype=torch.long) for b in batch])
-            lig_idx = torch.stack([torch.as_tensor(b[5], dtype=torch.long) for b in batch])
+            # Sob `--sim-emb-source cosine` nao ha matriz para indexar e as duas
+            # posicoes vem None: a 7-tupla continua sendo a forma canonica do
+            # caminho `--sim-terms` (e o que distingue do 5-tupla), so que com
+            # os indices vazios.
+            def stack_idx(lst):
+                if all(v is None for v in lst):
+                    return None
+                return torch.stack([torch.as_tensor(v, dtype=torch.long) for v in lst])
+
+            prot_idx = stack_idx([b[4] for b in batch])
+            lig_idx = stack_idx([b[5] for b in batch])
 
             return (voxs,
                     maybe_stack([b[1] for b in batch]),
