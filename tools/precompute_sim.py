@@ -52,6 +52,8 @@ def parse_args():
     p.add_argument("--seqs", type=Path, default=emb / "seqs.json")
     p.add_argument("--smiles-map", type=Path, default=emb / "complex_to_smiles.json")
     p.add_argument("--out-dir", type=Path, default=emb / "sim")
+    p.add_argument("--only", choices=["both", "prot", "lig"], default="both",
+                   help="Build only one of the matrices (the other file is left untouched).")
     p.add_argument("--morgan-radius", type=int, default=2)
     p.add_argument("--morgan-bits", type=int, default=2048)
     p.add_argument("--chunk", type=int, default=256,
@@ -261,13 +263,15 @@ def main():
     args.out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
-    s_prot, prot_map, n_prot_sent, n_prot = build_prot(args)
-    validate("S_prot", s_prot, n_prot, n_prot)
-    print(f"  complexes -> sentinel: {n_prot_sent}/{len(prot_map)}")
+    if args.only in ("both", "prot"):
+        s_prot, prot_map, n_prot_sent, n_prot = build_prot(args)
+        validate("S_prot", s_prot, n_prot, n_prot)
+        print(f"  complexes -> sentinel: {n_prot_sent}/{len(prot_map)}")
 
-    s_lig, lig_map, n_lig_sent, n_lig = build_lig(args)
-    validate("S_lig", s_lig, n_lig, n_lig)
-    print(f"  complexes -> sentinel: {n_lig_sent}/{len(lig_map)}")
+    if args.only in ("both", "lig"):
+        s_lig, lig_map, n_lig_sent, n_lig = build_lig(args)
+        validate("S_lig", s_lig, n_lig, n_lig)
+        print(f"  complexes -> sentinel: {n_lig_sent}/{len(lig_map)}")
 
     print(f"done in {time.time() - t0:.0f}s -> {args.out_dir}/")
 

@@ -11,8 +11,10 @@ Outputs (all under ``--out-dir``):
   ``ligands_unique.txt``     one canonical SMILES per unique ligand (for ChemBERTa)
   ``complex_to_smiles.json`` ``{complex_id: smiles}`` (convenience)
 
-Note: bond orders are perceived from geometry only; stereo may be less reliable
-than an authoritative source. Good enough for frozen ChemBERTa features.
+Note: every bond is added as SINGLE -- bond orders are NOT perceived, so the
+SMILES is a heavy-atom skeleton (no ``=``, ``#`` or aromaticity). Kept as-is
+because the checkpoints of campaigns 1-4 depend on these outputs; the
+bond-order-aware version is ``gen_smiles_ccd.py``.
 """
 
 import argparse
@@ -47,7 +49,8 @@ def parse_args():
     return p.parse_args()
 
 
-def coords_to_smiles(coords, elements, bond_tol):
+def coords_to_mol(coords, elements, bond_tol):
+    """Unsanitized single-bond graph with a conformer (hydrogens kept)."""
     coords = np.asarray(coords, dtype=float)
     els = np.asarray(elements)
     n = len(els)
@@ -65,7 +68,11 @@ def coords_to_smiles(coords, elements, bond_tol):
             d = float(np.linalg.norm(coords[:, i] - coords[:, j]))
             if 0.1 < d < bond_tol * (ri + rj):
                 m.AddBond(i, j, Chem.BondType.SINGLE)
-    mol = Chem.Mol(m)
+    return Chem.Mol(m)
+
+
+def coords_to_smiles(coords, elements, bond_tol):
+    mol = coords_to_mol(coords, elements, bond_tol)
     try:
         Chem.SanitizeMol(mol)
     except Exception:
