@@ -328,6 +328,24 @@ def _metricas_da_sopa(trainer, model, data_module, paths: list[str]):
     return {k: float(v) for k, v in extras[-1].items()}
 
 
+def _load_best_score(ckpt_path: str):
+    """val_pearsonr do melhor checkpoint lido do estado do ModelCheckpoint
+    gravado no arquivo (ckpt['callbacks']). None se nao for possivel ler.
+
+    Em Lightning >= 2.x, ckpt['callbacks'] e um dict {repr(callback): state};
+    em versoes antigas, uma lista de states. Os dois formatos sao aceitos."""
+    try:
+        cbs = torch.load(ckpt_path, map_location="cpu",
+                         weights_only=False).get("callbacks")
+        states = list(cbs.values()) if isinstance(cbs, dict) else (cbs or [])
+        for cb_state in states:
+            if isinstance(cb_state, dict) and cb_state.get("best_model_score") is not None:
+                return float(cb_state["best_model_score"])
+    except Exception:
+        return None
+    return None
+
+
 def emit_metrics_line(trainer, model, args) -> None:
     """Imprime a linha JSON de metricas que o worker do broker consome.
 
